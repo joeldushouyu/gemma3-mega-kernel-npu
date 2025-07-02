@@ -13,3 +13,6 @@
 [submodule "SubModules/transformers"]
 	path = SubModules/transformers
 	url = https://github.com/huggingface/transformers
+[submodule "mlir-aie"]
+	path = mlir-aie
+	url = https://github.com/Xilinx/mlir-aie
