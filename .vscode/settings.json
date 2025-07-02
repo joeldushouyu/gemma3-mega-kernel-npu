@@ -92,6 +92,12 @@
         "__verbose_abort": "cpp",
         "ios": "cpp",
         "locale": "cpp",
-        "print": "cpp"
+        "print": "cpp",
+        "csetjmp": "cpp",
+        "barrier": "cpp",
+        "propagate_const": "cpp",
+        "scoped_allocator": "cpp",
+        "syncstream": "cpp",
+        "expected": "cpp"
     }
 }

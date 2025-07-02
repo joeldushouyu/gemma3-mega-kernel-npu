@@ -1,0 +1,15 @@
+[submodule "SubModules/ggml"]
+	path = SubModules/ggml
+	url = https://github.com/ggml-org/ggml
+[submodule "SubModules/json"]
+	path = SubModules/json
+	url = https://github.com/nlohmann/json
+[submodule "SubModules/safetensors-cpp"]
+	path = SubModules/safetensors-cpp
+	url = https://github.com/syoyo/safetensors-cpp
+[submodule "SubModules/tokenizers-cpp"]
+	path = SubModules/tokenizers-cpp
+	url = https://github.com/mlc-ai/tokenizers-cpp
+[submodule "SubModules/transformers"]
+	path = SubModules/transformers
+	url = https://github.com/huggingface/transformers

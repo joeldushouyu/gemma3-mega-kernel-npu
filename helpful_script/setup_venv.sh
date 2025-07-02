@@ -6,10 +6,10 @@ source $VENV_DIR/bin/activate
 
 pip install tensorflow-cpu
 # install requirements from ggml
-pip install -r ../ggml/requirements.txt
+pip install -r ../SubModules/ggml/requirements.txt
 
 # install transformers
-cd ../transformers
+cd ../SubModules/transformers
 pip install -e .
 
 # install other dependencies
