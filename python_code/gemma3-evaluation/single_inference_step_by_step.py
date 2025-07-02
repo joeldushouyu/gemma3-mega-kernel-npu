@@ -95,6 +95,19 @@ messages = [
 
 
 
+# messages = [
+#     {
+#         "role": "system",
+#         "content": [{"type": "text", "text": "You are a helpful assistant."}]
+#     },
+#     {
+#         "role": "user",
+#         "content": [
+   
+#             {"type": "text", "text": "hi"}     
+#         ]
+#     }
+# ]
 
 
 # Process inputs

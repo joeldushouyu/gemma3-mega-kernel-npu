@@ -12,7 +12,7 @@ target_include_directories(${Gemma3Library} PUBLIC .)
 # print GGMl/include
 message( "CMAKE_SOURCE_DIR" ${CMAKE_SOURCE_DIR} )
 message( "CURRENT_SOURCE_DIR" ${CMAKE_CURRENT_SOURCE_DIR} )
-target_include_directories(${Gemma3Library} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../../ggml/src)
+target_include_directories(${Gemma3Library} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../../SubModules/ggml/src)
 target_link_libraries(${Gemma3Library} PRIVATE ggml common  nlohmann_json::nlohmann_json safetensors_cpp ) 
 
 

@@ -161,7 +161,7 @@ uint32_t add_tensor_to_safetensor(ggml_tensor* cur_ggml_tensor, const std::strin
 
 
     st.storage.resize(dst_offset + data_size);
-    void * data_res_ptr = nullptr;
+    // void * data_res_ptr = nullptr;
     if(cur_ggml_tensor->type == GGML_TYPE_Q4_0){
         std::vector<std::bfloat16_t> res = dequant_whole_q4_0_tensor( cur_ggml_tensor );
         assert(res.size() ==   data_size/sizeof(std::bfloat16_t) );
@@ -171,9 +171,10 @@ uint32_t add_tensor_to_safetensor(ggml_tensor* cur_ggml_tensor, const std::strin
                 res[i] -= static_cast<std::bfloat16_t>(1);
             }
         }
-        data_res_ptr = res.data();
+        memcpy(st.storage.data() + dst_offset, res.data(), data_size);
 
-    }else if(cur_ggml_tensor->type == GGML_TYPE_Q4_K){
+    }
+    else if(cur_ggml_tensor->type == GGML_TYPE_Q4_K){
         std::vector<std::bfloat16_t> res = dequant_whole_q4_k_tensor(cur_ggml_tensor);
         assert(res.size() ==   data_size/sizeof(std::bfloat16_t) );
         
@@ -182,7 +183,7 @@ uint32_t add_tensor_to_safetensor(ggml_tensor* cur_ggml_tensor, const std::strin
                 res[i] -= static_cast<std::bfloat16_t>(1);
             }
         }
-        data_res_ptr = res.data();
+        memcpy(st.storage.data() + dst_offset, res.data(), data_size);
 
     }else if(cur_ggml_tensor->type == GGML_TYPE_Q6_K){
         std::vector<std::bfloat16_t> res = dequant_whole_q6_k_tensor(cur_ggml_tensor);
@@ -193,8 +194,9 @@ uint32_t add_tensor_to_safetensor(ggml_tensor* cur_ggml_tensor, const std::strin
                 res[i] -= static_cast<std::bfloat16_t>(1);
             }
         }
-        data_res_ptr = res.data();
-    }else if( cur_ggml_tensor->type == GGML_TYPE_F16 && convert_FP_16 ){
+        memcpy(st.storage.data() + dst_offset, res.data(), data_size);
+    }
+    else if( cur_ggml_tensor->type == GGML_TYPE_F16 && convert_FP_16 ){
         std::vector<float> res;
         const std::float16_t* src = static_cast<const std::float16_t*>(cur_ggml_tensor->data);
         for(size_t i = 0; i < data_size/sizeof(float); i++){
@@ -207,43 +209,48 @@ uint32_t add_tensor_to_safetensor(ggml_tensor* cur_ggml_tensor, const std::strin
                 res[i] -= static_cast<std::bfloat16_t>(1);
             }
         }
-        data_res_ptr = res.data();
-    }else if(cur_ggml_tensor->type == GGML_TYPE_F16 && !convert_FP_16){
-        std::vector<std::float16_t> res;
-        const std::float16_t* src = static_cast<const std::float16_t*>(cur_ggml_tensor->data);
-        for(size_t i = 0; i < data_size/sizeof(float); i++){
-            res.push_back(src[i]);
-        }
+        memcpy(st.storage.data() + dst_offset, res.data(), data_size);
 
+    }else if(cur_ggml_tensor->type == GGML_TYPE_F16 && !convert_FP_16){
+        std::float16_t* data_ptr = static_cast<std::float16_t*>(cur_ggml_tensor->data);
+        std::vector<std::float16_t> res( data_ptr, data_ptr+  data_size/sizeof(std::float16_t)  );
+   
         if(apply_weight_minus_one_offset){
             for(size_t i = 0; i < res.size(); i++){
                 res[i] -= static_cast<std::float16_t>(1);
             }
         }
-        data_res_ptr = res.data();
+        memcpy(st.storage.data() + dst_offset, res.data(), data_size);
 
-    }else if(cur_ggml_tensor->type == GGML_TYPE_F32){
-        std::vector<float> res;
-        const float* src = static_cast<const float*>(cur_ggml_tensor->data);
-        for(size_t i = 0; i < data_size/sizeof(float); i++){
-            res.push_back(src[i]);
-        }
-
+    }
+    else if(cur_ggml_tensor->type == GGML_TYPE_F32){
+        float * data_ptr = static_cast<float*>(cur_ggml_tensor->data);
+        std::vector<float> res( data_ptr, data_ptr+  data_size/sizeof(float)  );
+   
         if(apply_weight_minus_one_offset){
             for(size_t i = 0; i < res.size(); i++){
                 res[i] -= static_cast<float>(1);
             }
         }
-        data_res_ptr = res.data();
+        memcpy(st.storage.data() + dst_offset, res.data(), data_size);
   
-    }else{
-       
+    }
+    else if(cur_ggml_tensor->type == GGML_TYPE_BF16){
+        std::bfloat16_t* data_ptr = static_cast<std::bfloat16_t*>(cur_ggml_tensor->data);
+        std::vector<std::bfloat16_t> res( data_ptr, data_ptr+  data_size/sizeof(std::bfloat16_t)  );
+   
+        if(apply_weight_minus_one_offset){
+            for(size_t i = 0; i < res.size(); i++){
+                res[i] -= static_cast<std::bfloat16_t>(1);
+            }
+        }
+ 
+        memcpy(st.storage.data() + dst_offset, res.data(), data_size);
+    }
+    else{
+        std::cout << "unhanle type" << cur_ggml_tensor->type  << std::endl;
         assert(1==2);
     }
-
-    assert(data_res_ptr != nullptr);
-
-    memcpy(st.storage.data() + dst_offset, data_res_ptr, data_size);
 
     st.tensors.insert(tensor_name, tensor);
 
@@ -265,10 +272,10 @@ int main(int argc, char ** argv){
     std::string decode_mode = argv[5];
     auto model = gemma3_mode_init_from_file(language_model_file, vision_model_file);
     
-    bool convert_fp_16 = false;
-    // if(decode_mode =="No_FP16"){
-    //     convert_fp_16 = false;
-    // }
+    bool convert_fp_16 = true;
+    if(decode_mode =="No_FP16"){
+        convert_fp_16 = false;
+    }
     fprintf(stdout, "Model initialized from file: %s\n", language_model_file.c_str());
 
 
@@ -284,17 +291,21 @@ int main(int argc, char ** argv){
 
         std::string att_norm_weight_header = common_language_header + std::to_string(i) + ".input_layernorm.weight";
         std::string ffn_norm_weight_header = common_language_header + std::to_string(i) + ".pre_feedforward_layernorm.weight";
+        std::string post_attention_norm_header = common_language_header + std::to_string(i)  + ".post_attention_layernorm.weight";
+        std::string post_ffw_norm_weight_header = common_language_header + std::to_string(i) + ".post_feedforward_layernorm.weight";
+        std::string self_attn_q_norm_header = common_language_header + std::to_string(i) + ".self_attn.q_norm.weight";
+        std::string self_attn_k_norm_header = common_language_header + std::to_string(i) + ".self_attn.k_norm.weight";
+
+
         std::string ffn_down_weight_header = common_language_header + std::to_string(i) + ".mlp.down_proj.weight";
         std::string ffn_gate_weight_header = common_language_header + std::to_string(i) + ".mlp.gate_proj.weight";
         std::string ffn_up_weight_header = common_language_header + std::to_string(i) + ".mlp.up_proj.weight";
 
-        std::string post_attention_norm_header = common_language_header + std::to_string(i)  + ".post_attention_layernorm.weight";
-        std::string post_ffw_norm_weight_header = common_language_header + std::to_string(i) + ".post_feedforward_layernorm.weight";
 
-        std::string self_attn_k_norm_header = common_language_header + std::to_string(i) + ".self_attn.k_norm.weight";
+
         std::string self_attn_k_weight_header = common_language_header + std::to_string(i) + ".self_attn.k_proj.weight";
         std::string self_attn_output_weight_header = common_language_header + std::to_string(i) + ".self_attn.o_proj.weight";
-        std::string self_attn_q_norm_header = common_language_header + std::to_string(i) + ".self_attn.q_norm.weight";
+
         std::string self_attn_q_weight_header = common_language_header + std::to_string(i) + ".self_attn.q_proj.weight";
         std::string self_attn_v_weight_header = common_language_header + std::to_string(i) +  ".self_attn.v_proj.weight";
 
@@ -304,17 +315,20 @@ int main(int argc, char ** argv){
         // But in order to convert to a safetensor that runs in python for reference, need to minus 1 for all nrom weight
 
 
-        total_byte_size += add_tensor_to_safetensor(model.attn_norm_weight.at(i), att_norm_weight_header, st,convert_fp_16 );
-        total_byte_size += add_tensor_to_safetensor(model.ffn_norm_weight.at(i), ffn_norm_weight_header, st,convert_fp_16);
+        total_byte_size += add_tensor_to_safetensor(model.attn_norm_weight.at(i), att_norm_weight_header, st,convert_fp_16,true);
+        total_byte_size += add_tensor_to_safetensor(model.ffn_norm_weight.at(i), ffn_norm_weight_header, st,convert_fp_16, true);
+        total_byte_size += add_tensor_to_safetensor(model.post_attention_norm_weight.at(i), post_attention_norm_header, st,convert_fp_16,true);
+        total_byte_size += add_tensor_to_safetensor(model.post_ffw_norm_weight.at(i), post_ffw_norm_weight_header, st,convert_fp_16,true);
+        total_byte_size += add_tensor_to_safetensor(model.attn_q_norm_weight.at(i), self_attn_q_norm_header, st,convert_fp_16,true);
+        total_byte_size += add_tensor_to_safetensor(model.attn_k_norm_weight.at(i), self_attn_k_norm_header, st,convert_fp_16,true);
+
+
         total_byte_size += add_tensor_to_safetensor(model.ffn_down_weight.at(i), ffn_down_weight_header, st,convert_fp_16);
         total_byte_size += add_tensor_to_safetensor(model.ffn_gate_weight.at(i), ffn_gate_weight_header, st,convert_fp_16);
         total_byte_size += add_tensor_to_safetensor(model.ffn_up_weight.at(i), ffn_up_weight_header, st,convert_fp_16);
-        total_byte_size += add_tensor_to_safetensor(model.post_attention_norm_weight.at(i), post_attention_norm_header, st,convert_fp_16);
-        total_byte_size += add_tensor_to_safetensor(model.post_ffw_norm_weight.at(i), post_ffw_norm_weight_header, st,convert_fp_16);
-        total_byte_size += add_tensor_to_safetensor(model.attn_k_norm_weight.at(i), self_attn_k_norm_header, st,convert_fp_16);
+
         total_byte_size += add_tensor_to_safetensor(model.attn_k_weight.at(i), self_attn_k_weight_header, st,convert_fp_16);
         total_byte_size += add_tensor_to_safetensor(model.attn_output_weight.at(i), self_attn_output_weight_header, st,convert_fp_16);
-        total_byte_size += add_tensor_to_safetensor(model.attn_q_norm_weight.at(i), self_attn_q_norm_header, st,convert_fp_16);
         total_byte_size += add_tensor_to_safetensor(model.attn_q_weight.at(i), self_attn_q_weight_header, st,convert_fp_16);
         total_byte_size += add_tensor_to_safetensor(model.attn_v_weight.at(i), self_attn_v_weight_header, st,convert_fp_16);
 

@@ -103,8 +103,8 @@ script_dir: str = os.path.dirname(os.path.abspath(__file__))
 cache_dir = os.path.join(script_dir, "hf_cache")
 if model_id == "google/gemma-3-4b-it":
     model_dir = os.path.join(cache_dir, "models--google--gemma-3-4b-it/snapshots/093f9f388b31de276ce2de164bdc2081324b9767")
-    model_dir = os.path.join(cache_dir, "models--google--gemma-3-4b-it/snapshots/dequant-q40")    
-    model_dir = os.path.join(cache_dir,"models--google--gemma-3-4b-it/snapshots/dequant-q4k-unsloth")        
+    # model_dir = os.path.join(cache_dir, "models--google--gemma-3-4b-it/snapshots/dequant-q40")    
+    # model_dir = os.path.join(cache_dir,"models--google--gemma-3-4b-it/snapshots/dequant-q4k-unsloth")        
 # `elif model_id == "google/gemma-3-12b-it":
 #     model_dir = os.path.join(cache_dir, "models--google--gemma-3-12b-it")    
 # elif model_id == "google/gemma-3-27b-it":
