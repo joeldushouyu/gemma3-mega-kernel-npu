@@ -16,3 +16,7 @@
 [submodule "mlir-aie"]
 	path = mlir-aie
 	url = https://github.com/Xilinx/mlir-aie
+[submodule "Template"]
+	path = Template
+	url = https://github.com/joeldushouyu/Template
+	branch = gemma3-mega-kernel-branch
