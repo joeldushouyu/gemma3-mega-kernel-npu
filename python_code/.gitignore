@@ -1,2 +1,3 @@
 /gemma3-evaluation/hf_cache
 /gemma3-evaluation/transformers_log.txt
+*.pyc
