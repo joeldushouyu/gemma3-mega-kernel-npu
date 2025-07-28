@@ -340,7 +340,9 @@ int main(int argc, char ** argv){
     total_byte_size += add_tensor_to_safetensor(model.output_norm_weight, "language_model.model.norm.weight", st, convert_fp_16);
 
     total_byte_size += add_tensor_to_safetensor(model.mm_input_projection_weight,"multi_modal_projector.mm_input_projection_weight", st,convert_fp_16);
-    total_byte_size += add_tensor_to_safetensor(model.mm_soft_emb_norm_weight,"multi_modal_projector.mm_soft_emb_norm.weight", st,convert_fp_16);
+    //NOTEL becayuse of specuial gemma rms norm weight, also apply -1 on soft_emb_norm weight
+    //https://github.com/ggml-org/llama.cpp/blob/00fa15fedc79263fa0285e6a3bbb0cfb3e3878a2/convert_hf_to_gguf.py#L4797    
+    total_byte_size += add_tensor_to_safetensor(model.mm_soft_emb_norm_weight,"multi_modal_projector.mm_soft_emb_norm.weight", st,convert_fp_16, true);
     total_byte_size += add_tensor_to_safetensor(model.v_patch_embd_bias,"vision_tower.vision_model.embeddings.patch_embedding.bias",st,convert_fp_16);
     total_byte_size += add_tensor_to_safetensor(model.v_patch_embd_weight, "vision_tower.vision_model.embeddings.patch_embedding.weight", st,convert_fp_16);
     total_byte_size += add_tensor_to_safetensor(model.v_position_embd_weight, "vision_tower.vision_model.embeddings.position_embedding.weight", st,convert_fp_16);
@@ -349,6 +351,7 @@ int main(int argc, char ** argv){
 
     const std::string common_vision_encoder_header = "vision_tower.vision_model.encoder.layers.";
     for(size_t i = 0; i < model.v_blk_ln1_bias.size(); i++){
+
         std::string v_blk_ln1_bias_header = common_vision_encoder_header + std::to_string(i) + ".layer_norm1.bias";
         std::string v_blk_ln1_weight_header = common_vision_encoder_header + std::to_string(i) + ".layer_norm1.weight";
         std::string v_blk_ln2_bias_header = common_vision_encoder_header + std::to_string(i) + ".layer_norm2.bias";
