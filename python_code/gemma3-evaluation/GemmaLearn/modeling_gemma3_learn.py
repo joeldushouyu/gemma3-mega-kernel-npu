@@ -351,6 +351,55 @@ def apply_rotary_pos_emb_np(q:np.ndarray, k:np.ndarray, cos:np.ndarray, sin:np.n
 
 
 
+class Gemma3MultiModalProjectorLearn(nn.Module):
+    def __init__(self, config: Gemma3Config):
+        super().__init__()
+
+        self.mm_input_projection_weight = nn.Parameter(
+            torch.zeros(config.vision_config.hidden_size, config.text_config.hidden_size)
+        )
+
+        self.mm_soft_emb_norm = Gemma3RMSNorm(
+            config.vision_config.hidden_size, eps=config.vision_config.layer_norm_eps
+        )
+
+        self.patches_per_image = int(config.vision_config.image_size // config.vision_config.patch_size)
+        self.tokens_per_side = int(config.mm_tokens_per_image**0.5)
+        self.kernel_size = self.patches_per_image // self.tokens_per_side
+        self.avg_pool = nn.AvgPool2d(kernel_size=self.kernel_size, stride=self.kernel_size)
+
+    def forward(self, vision_outputs: torch.Tensor, tensors_to_save:None|dict=None):
+        batch_size, _, seq_length = vision_outputs.shape
+
+        if tensors_to_save is not None:
+            tensors_to_save["before_average_pooling"] = vision_outputs.clone().contiguous()
+            
+        reshaped_vision_outputs = vision_outputs.transpose(1, 2)
+        reshaped_vision_outputs = reshaped_vision_outputs.reshape(
+            batch_size, seq_length, self.patches_per_image, self.patches_per_image
+        )
+        reshaped_vision_outputs = reshaped_vision_outputs.contiguous()
+
+        pooled_vision_outputs = self.avg_pool(reshaped_vision_outputs)
+        pooled_vision_outputs = pooled_vision_outputs.flatten(2)
+        pooled_vision_outputs = pooled_vision_outputs.transpose(1, 2)
+
+    
+        if tensors_to_save is not None: 
+            tensors_to_save["after_average_pooling"] = pooled_vision_outputs.contiguous()
+        print(f"shape after average pooling: {pooled_vision_outputs.shape}")
+        normed_vision_outputs = self.mm_soft_emb_norm(pooled_vision_outputs)
+
+        if tensors_to_save is not None:
+            tensors_to_save["after_mm_soft_emb_norm"] = normed_vision_outputs.contiguous()
+        print(f"eps of Gemma3RMSNorm is {self.mm_soft_emb_norm.eps}")    
+        projected_vision_outputs = torch.matmul(normed_vision_outputs, self.mm_input_projection_weight)
+        if tensors_to_save is not None:
+            tensors_to_save["after_mm_input_projection"] = projected_vision_outputs.contiguous()
+            tensors_to_save["mm_input_projection_weight"] = self.mm_input_projection_weight.contiguous()    
+        return projected_vision_outputs.type_as(vision_outputs)
+
+
 
 class Gemma3RMSNormMultiHeadLearn(nn.Module):
     #NOTE: has to do it in float32 precision
@@ -1263,7 +1312,7 @@ class Gemma3ModelLearn(Gemma3PreTrainedModel):
     def __init__(self, config: Gemma3Config):
         super().__init__(config)
         self.vision_tower = AutoModel.from_config(config=config.vision_config)
-        self.multi_modal_projector = Gemma3MultiModalProjector(config)
+        self.multi_modal_projector = Gemma3MultiModalProjectorLearn(config)
         self.vocab_size = config.text_config.vocab_size
 
         language_model =AutoModel.from_config(config=config.text_config)
@@ -1289,7 +1338,7 @@ class Gemma3ModelLearn(Gemma3PreTrainedModel):
     def get_decoder(self):
         return self.language_model
 
-    def get_image_features(self, pixel_values: torch.Tensor) -> torch.Tensor:
+    def get_image_features(self, pixel_values: torch.Tensor, tensors_to_save:Optional[dict] = None) -> torch.Tensor:
         """
         Projects the last hidden state from the vision model into language model space.
 
@@ -1299,8 +1348,8 @@ class Gemma3ModelLearn(Gemma3PreTrainedModel):
         Returns:
             image_features (`torch.Tensor`): Image feature tensor of shape `(num_images, image_length, embed_dim)`).
         """
-        vision_outputs = self.vision_tower(pixel_values=pixel_values).last_hidden_state
-        image_features = self.multi_modal_projector(vision_outputs)
+        vision_outputs = self.vision_tower(pixel_values=pixel_values,tensors_to_save=tensors_to_save).last_hidden_state
+        image_features = self.multi_modal_projector(vision_outputs, tensors_to_save=tensors_to_save)
         return image_features
 
     @can_return_tuple
@@ -1319,6 +1368,7 @@ class Gemma3ModelLearn(Gemma3PreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        tensors_to_save:Optional[dict] = None,
         **lm_kwargs,
     ) -> Union[tuple, Gemma3ModelOutputWithPast]:
         r"""
@@ -1376,7 +1426,7 @@ class Gemma3ModelLearn(Gemma3PreTrainedModel):
 
         # Merge text and images
         if pixel_values is not None:
-            image_features = self.get_image_features(pixel_values)
+            image_features = self.get_image_features(pixel_values,tensors_to_save=tensors_to_save)
 
             if input_ids is None:
                 special_image_mask = inputs_embeds == self.get_input_embeddings()(
@@ -1491,7 +1541,6 @@ class Gemma3ForConditionalGenerationLearn(Gemma3PreTrainedModel, GenerationMixin
     def multi_modal_projector(self):
         return self.model.multi_modal_projector
 
-    @auto_docstring
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -1508,6 +1557,7 @@ class Gemma3ForConditionalGenerationLearn(Gemma3PreTrainedModel, GenerationMixin
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
+        tensors_to_save:dict|None= None, 
         **lm_kwargs,
     ) -> Union[tuple, Gemma3CausalLMOutputWithPast]:
         r"""
@@ -1575,6 +1625,7 @@ class Gemma3ForConditionalGenerationLearn(Gemma3PreTrainedModel, GenerationMixin
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             cache_position=cache_position,
+            tensors_to_save=tensors_to_save,
             **lm_kwargs,
         )
 

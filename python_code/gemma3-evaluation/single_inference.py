@@ -102,9 +102,9 @@ model_id = "google/gemma-3-4b-it"
 script_dir: str = os.path.dirname(os.path.abspath(__file__))
 cache_dir = os.path.join(script_dir, "hf_cache")
 if model_id == "google/gemma-3-4b-it":
-    model_dir = os.path.join(cache_dir, "models--google--gemma-3-4b-it/snapshots/093f9f388b31de276ce2de164bdc2081324b9767")
+    # model_dir = os.path.join(cache_dir, "models--google--gemma-3-4b-it/snapshots/093f9f388b31de276ce2de164bdc2081324b9767")
     # model_dir = os.path.join(cache_dir, "models--google--gemma-3-4b-it/snapshots/dequant-q40")    
-    # model_dir = os.path.join(cache_dir,"models--google--gemma-3-4b-it/snapshots/dequant-q4k-unsloth")        
+    model_dir = os.path.join(cache_dir,"models--google--gemma-3-4b-it/snapshots/dequant-q4k-unsloth")        
 # `elif model_id == "google/gemma-3-12b-it":
 #     model_dir = os.path.join(cache_dir, "models--google--gemma-3-12b-it")    
 # elif model_id == "google/gemma-3-27b-it":
@@ -197,11 +197,17 @@ messages = [
     {
         "role": "user",
         "content": [
-            {"type": "image", "image": img_url},
-            {"type": "image", "image": img2_url},            
-            {"type": "image", "image": img3_url},         
-            {"type": "image", "image": img4_url},    
-            {"type": "text", "text": "Describe both image in detail, maybe also what are commona and difference among those images? Also, could they be AI generated"}     
+            {"type": "image", "image": "./text1.png"},             
+            # {"type": "image", "image": "./monke-ai.jpg"},            
+            # {"type": "image", "image": img_url},
+            # {"type": "image", "image": img2_url},    
+            # {"type": "image", "image": Image.open("./hydro_1.png")},
+            # {"type": "image", "image": Image.open("./hydro_2.png")},                 
+            # {"type": "image", "image": Image.open("./game_4.jpg")},
+            # {"type": "image", "image": Image.open("./game_3.jpg")},                            
+            # {"type": "image", "image": img3_url},         
+            # {"type": "image", "image": img4_url},    
+            {"type": "text", "text": "Can you extract the"}     
         ]
     }
 ]
@@ -220,25 +226,25 @@ messages = [
 #     }
 # ]
 
-def save_attention_module(common_header:str, module:Gemma3AttentionLearn, output_dict):
-    output_dict[common_header + "k_embed_multi_head_cache"] = numpy_to_tensor(module.k_embed_multi_head_cache, dtype=torch.bfloat16)  
-    output_dict[common_header + "v_embed_multi_head_cache"] = numpy_to_tensor(module.v_embed_multi_head_cache, dtype=torch.bfloat16)
-    output_dict[common_header + "attention_res_cache"] = numpy_to_tensor(module.attention_res_cache, dtype=torch.bfloat16)
-    output_dict[common_header + "attention_input_debug"] = module.attention_input_debug
-    output_dict[common_header + "attention_output_debug"] = module.attention_output_debug
+# def save_attention_module(common_header:str, module:Gemma3AttentionLearn, output_dict):
+#     output_dict[common_header + "k_embed_multi_head_cache"] = numpy_to_tensor(module.k_embed_multi_head_cache, dtype=torch.bfloat16)  
+#     output_dict[common_header + "v_embed_multi_head_cache"] = numpy_to_tensor(module.v_embed_multi_head_cache, dtype=torch.bfloat16)
+#     output_dict[common_header + "attention_res_cache"] = numpy_to_tensor(module.attention_res_cache, dtype=torch.bfloat16)
+#     output_dict[common_header + "attention_input_debug"] = module.attention_input_debug
+#     output_dict[common_header + "attention_output_debug"] = module.attention_output_debug
 
 
-def save_MLP_module(common_header:str, module:Gemma3MLPLearn, output_dict):
-    output_dict[common_header + "mlp_input_cache"] = module.mlp_input_cache
-    output_dict[common_header + "cache_gate_proj_res"] = module.cache_gate_proj_res
-    output_dict[common_header + "cache_up_proj_res"] = module.cache_up_proj_res
-    output_dict[common_header + "cache_gelu_res"] = module.cache_gelu_res
-    output_dict[common_header + "cache_down_proj_res_np"] = module.cache_down_proj_res_np
+# def save_MLP_module(common_header:str, module:Gemma3MLPLearn, output_dict):
+#     output_dict[common_header + "mlp_input_cache"] = module.mlp_input_cache
+#     output_dict[common_header + "cache_gate_proj_res"] = module.cache_gate_proj_res
+#     output_dict[common_header + "cache_up_proj_res"] = module.cache_up_proj_res
+#     output_dict[common_header + "cache_gelu_res"] = module.cache_gelu_res
+#     output_dict[common_header + "cache_down_proj_res_np"] = module.cache_down_proj_res_np
     
 
 
-def save_tensor_dict_to_safetensor(file_name, data_dict):
-    save_file(data_dict, file_name)
+# def save_tensor_dict_to_safetensor(file_name, data_dict):
+#     save_file(data_dict, file_name)
     
 
 # def save_prefill_data_to_file(filename:str, model:Gemma3ForConditionalGenerationLearn):
@@ -280,6 +286,15 @@ input_ids = inputs["input_ids"]
 attention_mask = inputs["attention_mask"]
 pixel_values =   None  if "pixel_values" not in inputs else    inputs["pixel_values"]
 
+
+# given pixel_value is a tensor, convert to numpy, then save it in raw binary format
+if pixel_values is not None:
+    #print the shape of pixel_values
+    print(f"pixel_values shape: {pixel_values.shape}, dtype: {pixel_values.dtype}")
+    pixel_values_np = tensor_to_numpy(pixel_values)
+    pixel_values_np.tofile("pixel_values.bin")
+    print(f"Save pixel_values shape {pixel_values_np.shape} to pixel_values.bin")
+
 input_len = input_ids.shape[-1]
 max_new_tokens = 200
 
@@ -287,6 +302,9 @@ max_new_tokens = 200
 
 input_ids_ref = input_ids.clone()
 input_ids_learn = input_ids.clone()
+
+
+tensors_to_save = {}
 # Generation loop
 for step in range(max_new_tokens):
     with torch.inference_mode():
@@ -307,7 +325,8 @@ for step in range(max_new_tokens):
             outputs_learn = model_learn(
                 input_ids=input_ids_learn,
                 attention_mask=attention_mask,
-                pixel_values=pixel_values,            
+                pixel_values=pixel_values,       
+                tensors_to_save=tensors_to_save     
             )
             
             outputs_ref = model(
@@ -315,20 +334,35 @@ for step in range(max_new_tokens):
                 attention_mask=attention_mask,
                 pixel_values=pixel_values,
             )            
+        if step==0:
             
-        if step ==0 or step == 1:
-            # for now, just save the attention debug info during inference
-            language_model:Gemma3TextModelLearn = model_learn.model.language_model
-            sliding_window_atten_example = language_model.layers[0].self_attn
-            sliding_attn_dict = {}
-            save_attention_module("",sliding_window_atten_example,  sliding_attn_dict)
-            save_tensor_dict_to_safetensor(f"sliding_attention_{step}.safetensors", sliding_attn_dict)
+            if "image_hidden_states" in outputs_ref:
+                tensors_to_save["image_hidden_states_ref"] = outputs_ref.image_hidden_states.contiguous()
+            for key, tensor in tensors_to_save.items():
+                tensors_to_save[key] = tensor.contiguous()           
+   
+            save_file(tensors_to_save, "prefill_data.safetensors")
             
             
-            full_atten_example = language_model.layers[5].self_attn
-            full_attn_dict = {}
-            save_attention_module("", full_atten_example, full_attn_dict)
-            save_tensor_dict_to_safetensor(f"full_attention_{step}.safetensors",full_attn_dict )
+            # check similarity with ref
+            assert torch.allclose(
+                tensors_to_save["image_hidden_states_ref"], 
+                tensors_to_save["after_mm_input_projection"],
+                atol=1e-5, rtol=1e-4
+            ), "Image hidden states do not match multi-modal projection output"
+        # if step ==0 or step == 1:
+        #     # for now, just save the attention debug info during inference
+        #     language_model:Gemma3TextModelLearn = model_learn.model.language_model
+        #     sliding_window_atten_example = language_model.layers[0].self_attn
+        #     sliding_attn_dict = {}
+        #     save_attention_module("",sliding_window_atten_example,  sliding_attn_dict)
+        #     save_tensor_dict_to_safetensor(f"sliding_attention_{step}.safetensors", sliding_attn_dict)
+            
+            
+        #     full_atten_example = language_model.layers[5].self_attn
+        #     full_attn_dict = {}
+        #     save_attention_module("", full_atten_example, full_attn_dict)
+        #     save_tensor_dict_to_safetensor(f"full_attention_{step}.safetensors",full_attn_dict )
             
             
             

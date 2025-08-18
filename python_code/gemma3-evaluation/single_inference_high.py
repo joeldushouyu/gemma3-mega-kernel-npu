@@ -70,8 +70,8 @@ messages = [
     {
         "role": "user",
         "content": [
-            {"type": "image", "image": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/bee.jpg"},
-            {"type": "text", "text": "Describe this image in detail."}
+            {"type": "image", "image": "./text1.png"},                
+            {"type": "text", "text": "Can you extract the text from the image"}      
         ]
     }
 ]
@@ -84,7 +84,7 @@ inputs = processor.apply_chat_template(
 input_len = inputs["input_ids"].shape[-1]
 
 with torch.inference_mode():
-    generation = model.generate(**inputs, max_new_tokens=100, do_sample=False)
+    generation = model.generate(**inputs, max_new_tokens=500, do_sample=False)
     generation = generation[0][input_len:]
 
 decoded = processor.decode(generation, skip_special_tokens=True)

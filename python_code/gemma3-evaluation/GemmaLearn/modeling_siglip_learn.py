@@ -21,7 +21,7 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.utils import ModelOutput, auto_docstring, can_return_tuple, logging, torch_int
 from transformers.models.siglip.configuration_siglip import SiglipConfig, SiglipTextConfig, SiglipVisionConfig
 
-
+import torch.nn.functional as F
 from.common_module import LayerNormLearn
 
 #TODO repalce it
@@ -61,6 +61,8 @@ class SiglipEncoderLayerLearn(GradientCheckpointingLayer):
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
         output_attentions: Optional[bool] = False,
+        tensors_to_save:dict|None=None,
+        layer_id:int|None=None,        
     ) -> tuple[torch.FloatTensor]:
         """
         Args:
@@ -74,17 +76,40 @@ class SiglipEncoderLayerLearn(GradientCheckpointingLayer):
         """
         residual = hidden_states
 
+        if tensors_to_save is not None:
+            assert layer_id is not None
+        
+        if tensors_to_save is not None:
+            tensors_to_save[f"layer_{layer_id}_before_norm1"] = hidden_states.contiguous()
         hidden_states = self.layer_norm1(hidden_states)
+        if tensors_to_save is not None:
+            tensors_to_save[f"layer_{layer_id}_after_norm1"] = hidden_states.contiguous()
+            
+            
         hidden_states, attn_weights = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             output_attentions=output_attentions,
         )
+        if tensors_to_save is not None:
+            tensors_to_save[f"layer_{layer_id}_after_attention"] = hidden_states.contiguous()
+        
         hidden_states = residual + hidden_states
-
         residual = hidden_states
+        
+        if tensors_to_save is not None:
+            tensors_to_save[f"layer_{layer_id}_before_norm2"] = hidden_states.contiguous()
+        
         hidden_states = self.layer_norm2(hidden_states)
+
+        if tensors_to_save is not None:
+            tensors_to_save[f"layer_{layer_id}_after_norm2"] = hidden_states.contiguous()
+        
         hidden_states = self.mlp(hidden_states)
+
+        if tensors_to_save is not None:
+            tensors_to_save[f"layer_{layer_id}_after_mlp"] = hidden_states.contiguous()
+                    
         hidden_states = residual + hidden_states
 
         outputs = (hidden_states,)
@@ -92,6 +117,8 @@ class SiglipEncoderLayerLearn(GradientCheckpointingLayer):
         if output_attentions:
             outputs += (attn_weights,)
 
+        if tensors_to_save is not None:
+            tensors_to_save[f"layer_{layer_id}_final"] = hidden_states.contiguous()
         return outputs
 
 
@@ -154,13 +181,23 @@ class SiglipVisionEmbeddingsLearn(nn.Module):
         patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
         return patch_pos_embed
 
-    def forward(self, pixel_values: torch.FloatTensor, interpolate_pos_encoding=False) -> torch.Tensor:
+    def forward(self, pixel_values: torch.FloatTensor, interpolate_pos_encoding=False, tensors_to_save:dict[str, Any]|None = None) -> torch.Tensor:
+        if tensors_to_save is not None:
+            clone_v: torch.Tensor =  pixel_values.clone()
+            tensors_to_save["conv2d_kernels"] = self.patch_embedding.weight.contiguous()
+            tensors_to_save["before_conv2d"] = clone_v.contiguous()
+            
         _, _, height, width = pixel_values.shape
         target_dtype = self.patch_embedding.weight.dtype
         #[image_number, width/filter_size,  grid, grid]
         patch_embeds = self.patch_embedding(pixel_values.to(dtype=target_dtype))  # shape = [*, width, grid, grid]
+        
+    
         # it flattens and reshape to [1, grid*grid, width/filter_size]
         embeddings = patch_embeds.flatten(2).transpose(1, 2)
+
+        if tensors_to_save is not None:
+            tensors_to_save["after_conv2d_with_reordered"] = embeddings.contiguous() #[num_image, H_out*W_out, hidden_size/num_kernels]
 
         if interpolate_pos_encoding:
             embeddings = embeddings + self.interpolate_pos_encoding(embeddings, height, width)
@@ -168,6 +205,8 @@ class SiglipVisionEmbeddingsLearn(nn.Module):
             # apply a absolute position embeddings on the embedding image(similar to the "Attention is all you need", note Rope)
             #[image_number, grid*grid, width/filter_size/embed_dim]
             embeddings = embeddings + self.position_embedding(self.position_ids)  #position_ids == grid*grid (4096 for 4bit-model)
+        if tensors_to_save is not None:
+            tensors_to_save["after_embeddings"] = embeddings.contiguous()
         return embeddings
 
 
@@ -203,6 +242,7 @@ class SiglipEncoderLearn(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
+        tensors_to_save:dict|None=None,
     ) -> BaseModelOutput:
         r"""
         Args:
@@ -235,7 +275,7 @@ class SiglipEncoderLearn(nn.Module):
         all_attentions = () if output_attentions else None
 
         hidden_states = inputs_embeds
-        for encoder_layer in self.layers:
+        for layer_id, encoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 encoder_states = encoder_states + (hidden_states,)
 
@@ -243,6 +283,8 @@ class SiglipEncoderLearn(nn.Module):
                 hidden_states,
                 attention_mask,
                 output_attentions=output_attentions,
+                tensors_to_save=tensors_to_save,
+                layer_id = layer_id
             )
 
             hidden_states = layer_outputs[0]
@@ -276,13 +318,14 @@ class SiglipVisionTransformerLearn(nn.Module):
         #     self.head = SiglipMultiheadAttentionPoolingHead(config)
 
     @can_return_tuple
-    @auto_docstring
+
     def forward(
         self,
         pixel_values,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         interpolate_pos_encoding: Optional[bool] = False,
+        tensors_to_save:dict|None=None,
     ) -> BaseModelOutputWithPooling:
         assert interpolate_pos_encoding== False
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -293,16 +336,29 @@ class SiglipVisionTransformerLearn(nn.Module):
         
         #[image_number, grid*grid(grid = image_width_height/kernel_size), image_embd_size]  #hidden_states after applyed position embedding
         # For gemma, it is [mimage_number, 64*64, image_embed_size=1152]
-        hidden_states = self.embeddings(pixel_values, interpolate_pos_encoding=interpolate_pos_encoding)
+        hidden_states = self.embeddings(pixel_values, interpolate_pos_encoding=interpolate_pos_encoding, tensors_to_save=tensors_to_save)
 
         encoder_outputs: BaseModelOutput = self.encoder(
             inputs_embeds=hidden_states,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
+            tensors_to_save=tensors_to_save
         )
 
+
         last_hidden_state = encoder_outputs.last_hidden_state
+        
+    
+        if tensors_to_save is not None:
+            tensors_to_save["before_post_layernorm"] = last_hidden_state.contiguous()   
+            tensors_to_save["post_layernorm_weight"] = self.post_layernorm.weight.contiguous()
+            tensors_to_save["post_layernorm_bias"] = self.post_layernorm.bias.contiguous()
+
+        print(f"post_layernorm eps: {self.post_layernorm.eps}")     
         last_hidden_state = self.post_layernorm(last_hidden_state)
+        
+        if tensors_to_save is not None:
+            tensors_to_save["after_post_layernorm"] = last_hidden_state.contiguous()
 
         pooler_output = self.head(last_hidden_state) if self.use_head else None
 
@@ -329,13 +385,13 @@ class SiglipVisionModelLearn(SiglipPreTrainedModel):
         return self.vision_model.embeddings.patch_embedding
 
     @can_return_tuple
-    @auto_docstring
     def forward(
         self,
         pixel_values,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         interpolate_pos_encoding: bool = False,
+        tensors_to_save:Optional[dict] = None
     ) -> BaseModelOutputWithPooling:
         r"""
         Examples:
@@ -363,4 +419,5 @@ class SiglipVisionModelLearn(SiglipPreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             interpolate_pos_encoding=interpolate_pos_encoding,
+            tensors_to_save=tensors_to_save
         )

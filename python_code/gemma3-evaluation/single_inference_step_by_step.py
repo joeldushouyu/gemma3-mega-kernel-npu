@@ -72,8 +72,8 @@ messages = [
     {
         "role": "user",
         "content": [
-            {"type": "image", "image": img3_url},    
-            {"type": "text", "text": "Describe image in detail, maybe also what are commona and difference among those images? Also, could they be AI generated"}     
+            {"type": "image", "image": "./text1.png"},                
+            {"type": "text", "text": "Can you extract the text from the image"}      
         ]
     }
 ]
@@ -131,7 +131,7 @@ attention_mask = inputs["attention_mask"]
 pixel_values =   None  if "pixel_values" not in inputs else    inputs["pixel_values"]
 
 input_len = input_ids.shape[-1]
-max_new_tokens = 50
+max_new_tokens = 500
 
 
 
