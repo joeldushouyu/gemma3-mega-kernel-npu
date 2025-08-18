@@ -1,2 +1,6 @@
+# Ignore Python cache files
+__pycache__/
 /hf_cache
 /test/model-00001-of-00001.safetensors
+*.pyc
+*.bin

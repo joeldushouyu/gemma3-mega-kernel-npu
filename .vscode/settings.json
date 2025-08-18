@@ -98,6 +98,19 @@
         "propagate_const": "cpp",
         "scoped_allocator": "cpp",
         "syncstream": "cpp",
-        "expected": "cpp"
+        "expected": "cpp",
+        "__hash_table": "cpp",
+        "__locale": "cpp",
+        "execution": "cpp",
+        "queue": "cpp",
+        "stack": "cpp",
+        "netfwd": "cpp",
+        "rope": "cpp",
+        "slist": "cpp",
+        "target": "cpp",
+        "__config": "cpp",
+        "__mutex_base": "cpp",
+        "filesystem": "cpp",
+        "stream_ref": "cpp"
     }
 }

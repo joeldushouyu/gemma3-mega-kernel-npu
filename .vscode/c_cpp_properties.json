@@ -11,23 +11,13 @@
                 "/usr/**",
                 "${workspaceFolder}/mlir-aie/lib/**",
                 "${workspaceFolder}/mlir-aie/runtime_lib/**",
-                // "./mlir-aie/ironenv/**",
-                // "./mlir-aie/ironenv/lib/**",
-                // "./mlir-aie/ironenv/bin/**",
-                // "./mlir-aie/ironenv/lib64/**",
-                // "./ironenv/include/**",
-                // "./**",
-                // "./my_install/mlir/lib/**",
                 "/tools/ryzen_ai-1.3.0/vitis_aie_essentials/**",
-                "/tools/ryzen_ai-1.3.0/vitis_aie_essentials/include/**",
-                "/tools/ryzen_ai-1.4.0/vitis_aie_essentials/**",
-                "/tools/ryzen_ai-1.4.0/vitis_aie_essentials/include/**",
-                // "./xdna-driver/"                                 
+                "/tools/ryzen_ai-1.3.0/vitis_aie_essentials/include/**"
             ],
             "defines": [],
-            "compilerPath": "/usr/bin/clang",
-            "cStandard": "c17",
-            "cppStandard": "c++20",
+            "compilerPath": "/usr/bin/gcc",
+            "cStandard": "c23",
+            "cppStandard": "c++23",
             "intelliSenseMode": "linux-clang-x64",
             "browse": {
                 "path": [

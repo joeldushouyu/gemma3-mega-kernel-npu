@@ -1,5 +1,5 @@
 #!/bin/bash
-source ../venv/bin/activate
+source venv/bin/activate
 mkdir -p build
 cd build
 cmake  -DGGML_BUILD_EXAMPLES=ON -DCMAKE_BUILD_TYPE=Debug ..
