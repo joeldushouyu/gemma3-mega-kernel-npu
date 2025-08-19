@@ -48,6 +48,9 @@ class GptOssExpertsLearn(GptOssExperts):
         self.alpha = 1.702
         self.limit = 7.0
 
+        self.first_time = True
+
+
     def forward(self, hidden_states: torch.Tensor, router_indices=None, routing_weights=None) -> torch.Tensor:
         """
         When training it is more efficient to just loop over the experts and compute the output for each expert
@@ -62,65 +65,64 @@ class GptOssExpertsLearn(GptOssExperts):
         Returns:
             torch.Tensor
         """
+        
+        if self.first_time:
+            self.first_time = False
+            self.gate_proj = self.gate_up_proj[..., ::2]
+            self.up_proj =  self.gate_up_proj[..., 1::2]
+            
+            self.gate_proj_bias = self.gate_up_proj_bias[..., ::2]
+            self.up_proj_bias = self.gate_up_proj_bias[..., 1::2]
+                        
+        
         batch_size = hidden_states.shape[0]
         hidden_states = hidden_states.reshape(-1, self.hidden_size)  #[batch_size, seq_len. hidden_size] -> [batch*seq_len, hidden_size]# (num_tokens, hidden_size)
         num_experts = routing_weights.shape[1]
-        if self.training:
-            next_states = torch.zeros_like(hidden_states, dtype=hidden_states.dtype, device=hidden_states.device)
-            with torch.no_grad():
-                expert_mask = torch.nn.functional.one_hot(router_indices, num_classes=num_experts)
-                expert_mask = expert_mask.permute(2, 1, 0)
-                # we sum on the top_k and on the sequence length to get which experts
-                # are hit this time around
-                expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-            for expert_idx in expert_hit[:]:
-                with torch.no_grad():
-                    _, token_idx = torch.where(expert_mask[expert_idx[0]])
-                current_state = hidden_states[token_idx]
-                gate_up = current_state @ self.gate_up_proj[expert_idx] + self.gate_up_proj_bias[expert_idx]
-                gate, up = gate_up[..., ::2], gate_up[..., 1::2]
-                gate = gate.clamp(min=None, max=self.limit)
-                up = up.clamp(min=-self.limit, max=self.limit)
-                glu = gate * torch.sigmoid(gate * self.alpha)
-                gated_output = (up + 1) * glu
-                out = gated_output @ self.down_proj[expert_idx] + self.down_proj_bias[expert_idx]
-                weighted_output = out[0] * routing_weights[token_idx, expert_idx, None]
-                next_states.index_add_(0, token_idx, weighted_output.to(hidden_states.dtype))
-            next_states = next_states.view(batch_size, -1, self.hidden_size)
-        else:
-            hidden_states = hidden_states.repeat(num_experts, 1)  # duplicate to exntend [batch*seq_len, hidden_size] to [num_expert*batch*seq_len, hidden_size]
-            hidden_states = hidden_states.view(num_experts, -1, self.hidden_size)  #reshape to [total_num_expert, batch*seq_len, hidden_size]
-            # self.gate_up_project is [total_num_expect, hidden_size, intermediate_size]
-            # self.gate_up_project_bias is [total_num_expert, intermediate_size]
-            
-            gate_up = torch.bmm(hidden_states, self.gate_up_proj) + self.gate_up_proj_bias[..., None, :]  # result in [total_num_expert, seq_len, intermediate_size*2]
-            # Note, it is intermediate_size*2 because of both gate and up
-            
-            #Note: it is doing a interleave, not simple split here  #TODO: avoid mix by rearrange the weight for inference?
-            gate, up = gate_up[..., ::2], gate_up[..., 1::2]
-            gate = gate.clamp(min=None, max=self.limit)
-            up = up.clamp(min=-self.limit, max=self.limit)
-            glu = gate * torch.sigmoid(gate * self.alpha)
-            
-            # down_project is [total_expert, intermediate_size, hidden_size]
-            next_states = torch.bmm(((up + 1) * glu), self.down_proj)
-            
-    
-            next_states = next_states + self.down_proj_bias[..., None, :]
-            
-            
-            next_states = next_states.view(num_experts, batch_size, -1, self.hidden_size)  # this store it back to [total_expert, batch, seq_len, hidden_size]
-            #recall routing_weights is [batch_size * seq_len, num_experts)]
-            
-            routing_weight_T = routing_weights.transpose(0, 1) #[ num_experts, batch_size * seq_len,]
-            routing_weight_T= routing_weight_T.view(num_experts, batch_size, -1) # reorder to [total_expert, batch_size, seq_len]
-            
-            
-            next_states = next_states * routing_weight_T[..., None]  # first expand routing_weight_t to [total_Expert, batch_size, seq_len, hidden_size], then do a element_wise multiplcation
-            # next_state is still [total_expert, batch, seq_len, hidden_size]
-            next_states = next_states.sum(dim=0)  # summ all expert(AKA sum the topK expert, because all no-select expert has routing_weight_T of zero, which then element-wise multiplcation result in 0.0)
 
-            # at this point, next_states is then shrink back to [batch, seq_len, hidden_size]
+        #Note: Pure inference
+        hidden_states = hidden_states.repeat(num_experts, 1)  # duplicate to exntend [batch*seq_len, hidden_size] to [num_expert*batch*seq_len, hidden_size]
+        hidden_states = hidden_states.view(num_experts, -1, self.hidden_size)  #reshape to [total_num_expert, batch*seq_len, hidden_size]
+        # self.gate_up_project is [total_num_expect, hidden_size, intermediate_size]
+        # self.gate_up_project_bias is [total_num_expert, intermediate_size]
+       
+
+        # gate_up = torch.bmm(hidden_states, self.gate_up_proj) + self.gate_up_proj_bias[..., None, :]  # result in [total_num_expert, seq_len, intermediate_size*2]
+        # # Note, it is intermediate_size*2 because of both gate and up
+
+        # #Note: it is doing a interleave, not simple split here  #TODO: avoid mix by rearrange the weight for inference?
+        # gate, up = gate_up[..., ::2], gate_up[..., 1::2]
+
+        gate = torch.bmm(hidden_states, self.gate_proj) + self.gate_proj_bias[..., None, :]
+        up: torch.Tensor = torch.bmm(hidden_states, self.up_proj) + self.up_proj_bias[..., None, :]
+
+        # # assert gate_t similar to gate
+        # assert torch.allclose(gate_t, gate, atol=1e-6)
+        # assert torch.allclose(up_t, up, atol=1e-6)
+        
+        
+        gate = gate.clamp(min=None, max=self.limit)
+        up = up.clamp(min=-self.limit, max=self.limit)
+        glu = gate * torch.sigmoid(gate * self.alpha)
+        
+        # down_project is [total_expert, intermediate_size, hidden_size]
+        next_states = torch.bmm(((up + 1) * glu), self.down_proj)
+        
+
+        next_states = next_states + self.down_proj_bias[..., None, :]
+        
+        
+        next_states = next_states.view(num_experts, batch_size, -1, self.hidden_size)  # this store it back to [total_expert, batch, seq_len, hidden_size]
+        #recall routing_weights is [batch_size * seq_len, num_experts)]
+        
+        routing_weight_T = routing_weights.transpose(0, 1) #[ num_experts, batch_size * seq_len,]
+        routing_weight_T= routing_weight_T.view(num_experts, batch_size, -1) # reorder to [total_expert, batch_size, seq_len]
+        
+        
+        next_states = next_states * routing_weight_T[..., None]  # first expand routing_weight_t to [total_Expert, batch_size, seq_len, hidden_size], then do a element_wise multiplcation
+        # next_state is still [total_expert, batch, seq_len, hidden_size]
+        next_states = next_states.sum(dim=0)  # summ all expert(AKA sum the topK expert, because all no-select expert has routing_weight_T of zero, which then element-wise multiplcation result in 0.0)
+
+        # at this point, next_states is then shrink back to [batch, seq_len, hidden_size]
         return next_states
 
 
