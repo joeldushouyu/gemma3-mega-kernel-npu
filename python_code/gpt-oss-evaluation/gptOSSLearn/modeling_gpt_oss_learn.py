@@ -342,16 +342,69 @@ class GptOssTopKRouterLearn(nn.Module):
         self.weight = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim))
         self.bias = nn.Parameter(torch.empty(self.num_experts))
 
+        
+        self.router_scores_cache = None
+        self.router_indices_cache = None
+        self.prev_seq_len = None
     def forward(self, hidden_states):
-        # input is [batch_size, seq_len, hidden_size]
-        hidden_states = hidden_states.reshape(-1, self.hidden_dim)  # change to [batch_size*seq_len, hidden_size]
-        # weight should be [num_expert, hidden_size]  #Note: the Linear will do a transpose on the weight matrix
-        router_logits = F.linear(hidden_states, self.weight, self.bias)  # (seq_len, num_experts)
-        router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)  # (seq_len, top_k)
-        router_top_value = torch.nn.functional.softmax(router_top_value, dim=1, dtype=router_top_value.dtype)
-        router_scores = torch.zeros_like(router_logits).scatter_(1, router_indices, router_top_value)
-        return router_scores, router_indices
-    
+
+
+        batch_size = hidden_states.shape[0]
+        if self.prev_seq_len is None:
+            self.prev_seq_len = hidden_states.shape[1]            
+            # input is [batch_size, seq_len, hidden_size]
+            hidden_states = hidden_states.reshape(-1, self.hidden_dim)  # change to [batch_size*seq_len, hidden_size]
+            # weight should be [num_expert, hidden_size]  #Note: the Linear will do a transpose on the weight matrix
+            router_logits = F.linear(hidden_states, self.weight, self.bias)  # (batch_size*seq_len, num_experts)
+            router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)  # (batch_size*seq_len, top_k)
+            router_top_value = torch.nn.functional.softmax(router_top_value, dim=1, dtype=router_top_value.dtype)
+            router_scores = torch.zeros_like(router_logits).scatter_(1, router_indices, router_top_value)
+            
+            self.router_scores_cache = router_scores.clone()
+            self.router_indices_cache = router_indices.clone()
+
+            
+            return router_scores, router_indices
+        else: 
+        
+            # at decode, only need to care the newest token
+            old_seq_len = self.prev_seq_len
+            seq_len =  hidden_states.shape[1]
+            self.prev_seq_len = seq_len           
+            # now change hidden_states to [batch_size*seq_len, hidden_size]
+            hidden_states = hidden_states.reshape(-1, self.hidden_dim)
+            
+            
+            hidden_states_decode = None
+            
+            for decode_row_idx in range( old_seq_len, batch_size*seq_len, seq_len ):
+                if hidden_states_decode is None:
+                    hidden_states_decode = hidden_states[decode_row_idx:decode_row_idx+1, :]
+                else:
+                    hidden_states_decode = torch.cat( (hidden_states_decode, hidden_states[decode_row_idx:decode_row_idx+1, :]), dim=0)
+
+            router_logits_decode = F.linear(hidden_states_decode, self.weight, self.bias)
+            router_top_value_decode, router_indices_decode =torch.topk(router_logits_decode, self.top_k, dim=-1) 
+            router_top_value_decode = torch.nn.functional.softmax(router_top_value_decode, dim=1, dtype=router_top_value_decode.dtype)  
+            router_scores_decode = torch.zeros_like(router_logits_decode).scatter_(1, router_indices_decode, router_top_value_decode)
+            
+            
+            
+            # for now, assert batch_Size = 1
+            assert batch_size == 1    
+            router_scores = self.router_scores_cache.clone()
+            router_indices = self.router_indices_cache.clone()
+
+            router_scores = torch.cat((router_scores, router_scores_decode), dim=0)
+            router_indices = torch.cat((router_indices, router_indices_decode), dim=0)
+
+
+            self.router_indices_cache = router_indices.clone()
+            self.router_scores_cache = router_scores.clone()
+            self.prev_seq_len = seq_len
+            
+            return router_scores, router_indices
+
 @use_kernel_forward_from_hub("MegaBlocksMoeMLP")
 class GptOssMLPLearn(nn.Module):
     def __init__(self, config):
