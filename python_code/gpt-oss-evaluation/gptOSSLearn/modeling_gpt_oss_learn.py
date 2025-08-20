@@ -1,5 +1,7 @@
 
 
+import numpy as np
+import numpy.typing as npt
 from typing import Callable, Optional, Union
 
 import torch
@@ -12,7 +14,6 @@ from transformers.models.gpt_oss.modeling_gpt_oss import load_balancing_loss_fun
 
 from transformers.models.gpt_oss.modeling_gpt_oss import GptOssPreTrainedModel,MoeModelOutputWithPast, MoeCausalLMOutputWithPast
 from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
-
 
 
 
@@ -33,6 +34,19 @@ from transformers.utils.generic import OutputRecorder, check_model_inputs
 
 from transformers.models.gpt_oss.modeling_gpt_oss import  GptOssExperts
 
+
+import numpy as np
+import numpy.typing as npt
+from .learn_util import tensor_to_numpy, numpy_to_tensor, assert_tensor_same_float, get_relativeL2, get_relativeL1, get_rmse, get_cosine_similarity
+
+import scipy
+
+
+
+
+def sigmoid_np(x):
+    return 1 / (1 + np.exp(-x))
+
 #NOTE: somehow has to override it for now
 class GptOssExpertsLearn(GptOssExperts):
     def __init__(self, config):
@@ -50,6 +64,176 @@ class GptOssExpertsLearn(GptOssExperts):
 
         self.first_time = True
 
+        self.prefill_state = True
+        
+        
+        self.hidden_states_cache = None
+    def numpy_forward(self, hidden_states:npt.NDArray[np.float32], outer_indices=npt.NDArray[np.int32], routing_weights=npt.NDArray[np.float32])-> npt.NDArray[np.float32]:
+
+        # outer_indices is [batch*seq_len, top_k]  The top_k is range(0, total_expert-1), aka the index of all expert
+        # routing_weights is [batch_size* seq_len, num_expert] is is a enlarge matrix of outer_indices, all not-choosen experts in each row has valyue of "0.0"
+        
+        
+        batch_size = hidden_states.shape[0]
+        seq_len = hidden_states.shape[1]
+        hidden_size = hidden_states.shape[2]
+        hidden_states = hidden_states.reshape(-1, self.hidden_size)  # shrink down to [batch*seq_len, hidden_size ]
+        
+        top_k = outer_indices.shape[1] # number of active expert
+        
+        # do it differently compare the the batch MM
+        
+        # for expert, it builds its own matrix 
+        
+        assert self.num_experts == routing_weights.shape[1]
+        
+
+        gate_proj_np = tensor_to_numpy(self.gate_proj)
+        up_proj_np = tensor_to_numpy(self.up_proj)
+        
+        gate_proj_bias_np = tensor_to_numpy(self.gate_proj_bias)
+        up_proj_bias_np = tensor_to_numpy(self.up_proj_bias)
+
+        down_proj_np = tensor_to_numpy(self.down_proj)
+        down_proj_bias_np = tensor_to_numpy(self.down_proj_bias)
+        
+        if self.prefill_state:
+            self.prefill_state = False
+        
+            next_states_out = np.zeros((batch_size* seq_len, hidden_size))
+
+            for expert_idx in range(self.num_experts):
+                # Each expert has a correspond "expert_hidden_size" matrix of [select_seq_len, hidden_size]
+                _valid_expert_row_idx = []
+                expert_hidden_states = None
+                
+                for row_idx in range(batch_size*seq_len):
+                    cur_row_top_k = outer_indices[row_idx]  # this is [top_k]
+                    
+                    if expert_idx in cur_row_top_k.tolist():  # this row has selected this expert
+                        _valid_expert_row_idx.append(row_idx)
+                        if expert_hidden_states is None:
+                            expert_hidden_states = hidden_states[row_idx:row_idx+1, :]
+                        else:
+                            expert_hidden_states = np.concatenate((expert_hidden_states, hidden_states[row_idx:row_idx+1, :]), axis=0)
+                    
+                if expert_hidden_states is None:
+                    continue
+                
+                # when expert_hidden_states is not None
+                expert_hidden_size = expert_hidden_states.shape[0]
+                # at this point, we are done with building this hidden_states for this expert
+
+                
+                #TODO: could have now refuse the gate_proj_np and gate_bias_np back together
+                expert_gate = np.matmul(expert_hidden_states, gate_proj_np[expert_idx])\
+                    + np.broadcast_to(gate_proj_bias_np[expert_idx], (expert_hidden_size,self.expert_dim))
+                    
+                expert_up = np.matmul(expert_hidden_states, up_proj_np[expert_idx])\
+                    + np.broadcast_to(up_proj_bias_np[expert_idx], (expert_hidden_size,self.expert_dim))
+                
+                # do a clamp on gate and up
+                expert_gate = np.clip(expert_gate, a_min=None, a_max = self.limit)
+                expert_up = np.clip(expert_up, a_min=-self.limit, a_max=self.limit) 
+                
+                
+                expert_glu = expert_gate * sigmoid_np(expert_gate * self.alpha)
+                
+                
+                expert_temp = (expert_up+ 1) * expert_glu # add 1 to all elelemnt, then do element-wise multiplcation 
+                expert_next_states = np.matmul(expert_temp, down_proj_np[expert_idx])\
+                    + np.broadcast_to(down_proj_bias_np[expert_idx], (expert_hidden_size, hidden_size))
+
+                # expert_next_states is [expert_hidden_size, hidden_size]
+                
+                # now, multiply each row in expert_next_states with the corresponding scores
+                
+                for  i, row_idx in enumerate( _valid_expert_row_idx):
+                    next_states_out[row_idx] += expert_next_states[i]* np.broadcast_to(routing_weights[row_idx][expert_idx],  (hidden_size,)  ) 
+            
+            
+            # reshape next_states_out back to [batch_size, seq_len, hidden_size]
+            next_states_out = next_states_out.reshape(batch_size, seq_len, hidden_size)
+
+
+            self.hidden_states_cache = next_states_out.copy()
+            return next_states_out
+        else:
+            # Decode stage - process only the newest token for each batch
+            # Input seq_len should be 1 in decode stage (processing one new token at a time)
+            # But output seq_len = 1 + cached_seq_len (concatenate with cached previous computations)
+            
+            # Process the current new token (same logic as prefill but for current seq_len tokens)
+
+            cached_seq_len = self.hidden_states_cache.shape[1]
+            total_seq_len = cached_seq_len + seq_len
+            
+
+                # Calculate how much padding is needed for the sequence length dimension
+            padding_amount = seq_len - cached_seq_len
+            assert padding_amount == 1
+            # Define the padding width for each dimension: ((before, after), (before, after), ...)
+            # (batch_dim, seq_dim, hidden_dim)
+            pad_width = ((0, 0), (0, padding_amount), (0, 0))
+
+            # Apply the padding with a constant value of 0
+            next_states_out = np.pad(self.hidden_states_cache, pad_width, mode='constant', constant_values=0)
+
+            next_states_out = next_states_out.reshape( batch_size* seq_len, hidden_size)
+
+            for expert_idx in range(self.num_experts):
+                # Each expert has a correspond "expert_hidden_size" matrix of [select_seq_len, hidden_size]
+                _valid_expert_row_idx = []
+                expert_hidden_states = None
+                
+                for row_idx in range(cached_seq_len, batch_size*seq_len, seq_len   ):
+                    cur_row_top_k = outer_indices[row_idx]  # this is [top_k]
+                    
+                    if expert_idx in cur_row_top_k.tolist():  # this row has selected this expert
+                        _valid_expert_row_idx.append(row_idx)
+                        if expert_hidden_states is None:
+                            expert_hidden_states = hidden_states[row_idx:row_idx+1, :]
+                        else:
+                            expert_hidden_states = np.concatenate((expert_hidden_states, hidden_states[row_idx:row_idx+1, :]), axis=0)
+                    
+                if expert_hidden_states is None:
+                    continue
+                
+                # when expert_hidden_states is not None
+                expert_hidden_size = expert_hidden_states.shape[0]
+                
+                # Compute expert forward pass for the current new token
+                expert_gate = np.matmul(expert_hidden_states, gate_proj_np[expert_idx])\
+                    + np.broadcast_to(gate_proj_bias_np[expert_idx], (expert_hidden_size, self.expert_dim))
+                    
+                expert_up = np.matmul(expert_hidden_states, up_proj_np[expert_idx])\
+                    + np.broadcast_to(up_proj_bias_np[expert_idx], (expert_hidden_size, self.expert_dim))
+                
+                # do a clamp on gate and up
+                expert_gate = np.clip(expert_gate, a_min=None, a_max=self.limit)
+                expert_up = np.clip(expert_up, a_min=-self.limit, a_max=self.limit) 
+                
+                expert_glu = expert_gate * sigmoid_np(expert_gate * self.alpha)
+                
+                expert_temp = (expert_up + 1) * expert_glu
+                expert_next_states = np.matmul(expert_temp, down_proj_np[expert_idx])\
+                    + np.broadcast_to(down_proj_bias_np[expert_idx], (expert_hidden_size, hidden_size))
+
+                # expert_next_states is [expert_hidden_size, hidden_size]
+                
+                # now, multiply each row in expert_next_states with the corresponding scores
+                for i, row_idx in enumerate(_valid_expert_row_idx):
+                    next_states_out[row_idx] += expert_next_states[i] * np.broadcast_to(routing_weights[row_idx][expert_idx], (hidden_size,))
+            
+            # reshape next_states_out back to [batch_size, seq_len=1, hidden_size]
+            next_states_out = next_states_out.reshape(batch_size, seq_len, hidden_size)
+            
+            # Concatenate with cached states from previous computations
+
+            self.hidden_states_cache = next_states_out.copy()
+            return next_states_out
+            
+            
 
     def forward(self, hidden_states: torch.Tensor, router_indices=None, routing_weights=None) -> torch.Tensor:
         """
@@ -75,6 +259,12 @@ class GptOssExpertsLearn(GptOssExperts):
             self.up_proj_bias = self.gate_up_proj_bias[..., 1::2]
                         
         
+        
+        res_np =  self.numpy_forward(tensor_to_numpy(hidden_states), tensor_to_numpy(router_indices), tensor_to_numpy(routing_weights))
+        
+        # res_torch = numpy_to_tensor(res_np, dtype=hidden_states.dtype)
+        
+        
         batch_size = hidden_states.shape[0]
         hidden_states = hidden_states.reshape(-1, self.hidden_size)  #[batch_size, seq_len. hidden_size] -> [batch*seq_len, hidden_size]# (num_tokens, hidden_size)
         num_experts = routing_weights.shape[1]
@@ -82,8 +272,8 @@ class GptOssExpertsLearn(GptOssExperts):
         #Note: Pure inference
         hidden_states = hidden_states.repeat(num_experts, 1)  # duplicate to exntend [batch*seq_len, hidden_size] to [num_expert*batch*seq_len, hidden_size]
         hidden_states = hidden_states.view(num_experts, -1, self.hidden_size)  #reshape to [total_num_expert, batch*seq_len, hidden_size]
-        # self.gate_up_project is [total_num_expect, hidden_size, intermediate_size]
-        # self.gate_up_project_bias is [total_num_expert, intermediate_size]
+        # self.gate_up_project is [total_num_expect, hidden_size, intermediate_size*2]
+        # self.gate_up_project_bias is [total_num_expert, intermediate_size*2]
        
 
         # gate_up = torch.bmm(hidden_states, self.gate_up_proj) + self.gate_up_proj_bias[..., None, :]  # result in [total_num_expert, seq_len, intermediate_size*2]
@@ -123,6 +313,23 @@ class GptOssExpertsLearn(GptOssExperts):
         next_states = next_states.sum(dim=0)  # summ all expert(AKA sum the topK expert, because all no-select expert has routing_weight_T of zero, which then element-wise multiplcation result in 0.0)
 
         # at this point, next_states is then shrink back to [batch, seq_len, hidden_size]
+        
+        
+        
+        # check if res_torch is same to next_states
+        # print out the four erros
+        next_states_np = tensor_to_numpy(next_states)
+        L1_err = get_relativeL1(res_np, next_states_np)
+        L2_err = get_relativeL2(res_np, next_states_np)
+        rmse_err = get_rmse(res_np, next_states_np)
+        cosine_sim = get_cosine_similarity(res_np, next_states_np)
+
+        print(f"L1 Error: {L1_err}")
+        print(f"L2 Error: {L2_err}")
+        print(f"RMSE Error: {rmse_err}")
+        print(f"Cosine Similarity: {cosine_sim}")
+
+        # assert torch.allclose(res_torch, next_states, atol=1e-6)
         return next_states
 
 
