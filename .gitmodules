@@ -20,3 +20,6 @@
 	path = Template
 	url = https://github.com/joeldushouyu/Template
 	branch = gemma3-mega-kernel-branch
+[submodule "SubModules/llama.cpp"]
+	path = SubModules/llama.cpp
+	url = https://github.com/ggml-org/llama.cpp
