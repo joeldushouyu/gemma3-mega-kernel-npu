@@ -22,107 +22,7 @@ from gguf.gguf_reader import GGUFReader
 from gguf.quants import dequantize
 from gguf import ReaderTensor
 import gguf
-from util import print_tensor_erros, print_numpy_errors
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# def dequantize_e2m1(value: int) -> float:
-#     """Dequantizes a 4-bit E2M1 float."""
-#     if value < 0 or value > 15:
-#         raise ValueError("Input must be a 4-bit integer (0-15)")
-
-#     sign = (value >> 3) & 1
-#     exponent = (value >> 1) & 3
-#     mantissa = value & 1
-
-#     if exponent == 0:
-#         # Subnormal number: (-1)^sign * 2^(-1) * (mantissa / 2)
-#         if mantissa == 0:
-#             return 0.0 if sign == 0 else -0.0
-#         else:
-#             return ((-1) ** sign) * (2 ** (-1)) * (mantissa / 2.0)
-#     else:
-#         # Normal number: (-1)^sign * 2^(exponent - 1) * (1 + mantissa / 2)
-#         return ((-1) ** sign) * (2 ** (exponent - 1)) * (1.0 + mantissa / 2.0)
-
-# def dequantize_mxf4_tensor(blocks_tensor: np.ndarray, scales_tensor: np.ndarray, block_size: int = 32) -> np.ndarray:
-#     """
-#     Dequantizes an MXF4 tensor given the quantized blocks and their scales.
-    
-#     Args:
-#         blocks_tensor: Quantized blocks of shape (32, 2880, 90, 16) containing packed 4-bit values
-#         scales_tensor: Scale factors of shape (32, 2880, 90) for each block
-#         block_size: Size of each block (default: 32, but actually refers to elements per scale)
-    
-#     Returns:
-#         Dequantized float32 array
-#     """
-#     # Validate inputs
-#     assert blocks_tensor.dtype == np.uint8, f"Expected uint8 blocks, got {blocks_tensor.dtype}"
-#     assert not np.isnan(scales_tensor).any(), "Scale tensor contains NaN values"
-#     assert not np.isinf(scales_tensor).any(), "Scale tensor contains infinite values"
-    
-#     # Get shapes
-#     batch_size, num_experts, num_blocks, bytes_per_block = blocks_tensor.shape
-#     assert scales_tensor.shape == (batch_size, num_experts, num_blocks), \
-#         f"Scale shape {scales_tensor.shape} doesn't match expected {(batch_size, num_experts, num_blocks)}"
-    
-#     # Each byte contains 2 4-bit values, so we get 32 values per block (16 bytes * 2)
-#     values_per_block = bytes_per_block * 2
-    
-#     # Output shape: (batch_size, num_experts, num_blocks * values_per_block)
-#     output_shape = (batch_size, num_experts, num_blocks * values_per_block)
-#     dequantized = np.zeros(output_shape, dtype=np.float32)
-    
-#     for b in range(batch_size):
-#         for e in range(num_experts):
-#             for block_idx in range(num_blocks):
-#                 scale = scales_tensor[b, e, block_idx]
-#                 block_bytes = blocks_tensor[b, e, block_idx, :]
-                
-#                 # Dequantize each byte in the block
-#                 for byte_idx, byte_val in enumerate(block_bytes):
-#                     # Ensure byte_val is in valid range
-#                     byte_val = int(byte_val) & 0xFF
-                    
-#                     # Unpack two 4-bit values from each byte
-#                     val1 = byte_val & 0x0F
-#                     val2 = (byte_val >> 4) & 0x0F
-                    
-#                     # Calculate output indices
-#                     base_idx = block_idx * values_per_block + byte_idx * 2
-#                     idx1 = base_idx
-#                     idx2 = base_idx + 1
-                    
-#                     # Dequantize and scale
-#                     if idx1 < output_shape[2]:
-#                         dequantized[b, e, idx1] = dequantize_e2m1(val1) * scale
-#                     if idx2 < output_shape[2]:
-#                         dequantized[b, e, idx2] = dequantize_e2m1(val2) * scale
-    
-#     # Validate output
-#     nan_count = np.isnan(dequantized).sum()
-#     inf_count = np.isinf(dequantized).sum()
-#     if nan_count > 0:
-#         print(f"Warning: Dequantized tensor contains {nan_count} NaN values")
-#     if inf_count > 0:
-#         print(f"Warning: Dequantized tensor contains {inf_count} infinite values")
-    
-#     return dequantized
-
+from util import print_tensor_erros, print_numpy_errors, replace_blk_with_model_layer_str, restore_from_repack_mxfp4_direct
 
 def dequantize_e2m1_vectorized(values: np.ndarray) -> np.ndarray:
     """Vectorized dequantization for an array of 4-bit E2M1 values."""
@@ -226,114 +126,18 @@ def read_gguf_file(gguf_file_path):
 
 
 
-#  --- Restoration Functions ---
-
-def reverse_transform_nibble_layout(tensor: Tensor) -> Tensor:
-    """Reverses the custom nibble layout transformation."""
-    assert tensor.dtype == torch.uint8
-    assert tensor.shape[-1] == 16
-
-    # 1. Reverse the final nibble swap
-    t_lo = tensor & 0x0F
-    t_hi = tensor & 0xF0
-    interleaved = (t_lo << 4) | (t_hi >> 4)
-
-    # 2. De-interleave the nibbles from abababab... back to aaaa...bbbb...
-    # The high nibbles of 'interleaved' contain the nibbles for the first half (blk_a)
-    nibbles_a_parts = interleaved & 0xF0
-    # The low nibbles of 'interleaved' contain the nibbles for the second half (blk_b)
-    nibbles_b_parts = interleaved & 0x0F
-
-    # Reconstruct blk_a by packing the high nibbles back together
-    # Pair up nibbles: (1st high nibble) | (2nd high nibble >> 4)
-    blk_a = nibbles_a_parts[..., 0::2] | (nibbles_a_parts[..., 1::2] >> 4)
-
-    # Reconstruct blk_b by packing the low nibbles back together
-    # Pair up nibbles: (1st low nibble << 4) | (2nd low nibble)
-    blk_b = (nibbles_b_parts[..., 0::2] << 4) | nibbles_b_parts[..., 1::2]
-
-    deinterleaved = torch.cat((blk_a, blk_b), dim=-1)
-
-    # 3. Reverse the initial nibble swap
-    t_lo = deinterleaved & 0x0F
-    t_hi = deinterleaved & 0xF0
-    original_tensor = (t_lo << 4) | (t_hi >> 4)
-
-    return original_tensor
-
-def restore_from_repack_mxfp4_direct(structured_data: np.ndarray) -> tuple[Tensor, Tensor]:
-    """
-    Restores the original blocks and scales from structured MXFP4 data.
-    
-    Args:
-        structured_data: Numpy array of shape (32, 2880, 90, 17) from GGUF MXFP4 tensor
-    """
-    # Make a copy to ensure it's writable and convert to PyTorch tensor
-    structured_tensor = torch.from_numpy(structured_data.copy()).to(torch.uint8)
-    
-    # Split the scales and blocks
-    # Scales are the first element in each 17-byte group
-    scales_packed = structured_tensor[..., 0]
-    # Blocks are the remaining 16 elements
-    blocks_packed = structured_tensor[..., 1:17]
-
-    # Restore the blocks by applying the reverse transformation
-    blocks_restored = reverse_transform_nibble_layout(blocks_packed)
-    
-    return blocks_restored, scales_packed
-
-
-def restore_from_repack_mxfp4(repacked_data: np.ndarray, original_shape: tuple) -> tuple[Tensor, Tensor]:
-    """
-    Restores the original blocks and scales from the repacked numpy array.
-    
-    Args:
-        repacked_data: The numpy array output by repack_mxfp4.
-        original_shape: The original shape of the 'blocks' tensor (e.g., (1, 64, 32, 16)).
-    """
-    # 1. Convert numpy array back to a PyTorch tensor
-    repacked_tensor = torch.from_numpy(repacked_data).to(torch.uint8)
-
-    # 2. Reshape the data to restore the last dimension
-    # The packed format has 1 byte for scale + 16 bytes for blocks = 17 bytes per group.
-    num_groups = original_shape[2]
-    structured_shape = (*original_shape[:2], num_groups, 17)
-    structured_data = repacked_tensor.view(structured_shape)
-    
-    # 3. Split the scales and blocks
-    # Scales are the first element in each 17-byte group
-    scales_repacked = structured_data[..., 0]
-    # Blocks are the remaining 16 elements
-    blocks_repacked = structured_data[..., 1:17]
-
-    # 4. Restore the blocks by applying the reverse transformation
-    blocks_restored = reverse_transform_nibble_layout(blocks_repacked)
-    
-    # The scales tensor is already correct, just ensure it has the right shape
-    scales_restored = scales_repacked
-    
-    return blocks_restored, scales_restored
-
-
-
-def replace_blk_with_model_layer_str(in_str:str):
-    return in_str.replace("blk", "model.layers")
-    
-
 
 def convert_q4_gguf_to_safetensor(gguf_file_path:str, 
-                                  data_to_save: dict) -> None:
+                                  data_to_save: dict,
+                                  TOTAL_LAYER:int,
+                                    EXPERT_COUNT:int,
+                                    EXPERT_FEED_FORWAR_SIZE:int,
+                                    INTERMEDIATE_SIZE:int
+                                  ) -> None:
 
 
     
     gguf_reader = GGUFReader(gguf_file_path)
-    
-    
-
-    # # extract jinja_str
-    # chat_template_field = gguf_reader.get_field(gguf.Keys.Tokenizer.CHAT_TEMPLATE)
-    # if chat_template_field:
-    #     template_str = chat_template_field.contents().strip().replace('\n', '\\n')
     
     
     
@@ -363,8 +167,9 @@ def convert_q4_gguf_to_safetensor(gguf_file_path:str,
     assert model_embed_token_weight.tensor_type.name == "Q4_1"
     data_to_save["model.embed_tokens.weight"] = torch.tensor(dequantize(model_embed_token_weight.data, model_embed_token_weight.tensor_type), dtype=torch.bfloat16)
     
+
     
-    TOTAL_LAYER= 24
+    
     
     for layer_idx in range(TOTAL_LAYER):
     # for layer_idx in range(7,8):
@@ -379,7 +184,7 @@ def convert_q4_gguf_to_safetensor(gguf_file_path:str,
         mlp_exp_up_bias = torch.tensor(dequantize(mlp_exp_up_bias.data, mlp_exp_up_bias.tensor_type), dtype=torch.bfloat16)
         mlp_exp_gate_bas = torch.tensor(dequantize(mlp_exp_gate_bas.data, mlp_exp_gate_bas.tensor_type), dtype=torch.bfloat16)
         
-        merged_bias = torch.empty( (32, 2880*2), dtype=mlp_exp_gate_bas.dtype )
+        merged_bias = torch.empty( (EXPERT_COUNT, EXPERT_FEED_FORWAR_SIZE*2), dtype=mlp_exp_gate_bas.dtype )
         merged_bias[..., ::2] = mlp_exp_gate_bas
         merged_bias[..., 1::2] = mlp_exp_up_bias
         data_to_save[safetensor_layer_common_prefix + "mlp.experts.gate_up_proj_bias"] = merged_bias
@@ -444,7 +249,7 @@ def convert_q4_gguf_to_safetensor(gguf_file_path:str,
         ffn_down_exps_weights = gguf_name_to_tensors[gguf_layer_common_prefix + "ffn_down_exps.weight"]
         assert ffn_down_exps_weights.tensor_type.name == "MXFP4", f"Expected MXFP4, got {ffn_down_exps_weights.tensor_type.name}"
         # The data is already shaped as (32, 2880, 1530), need to reshape to (32, 2880, 90, 17)
-        ffn_down_data = ffn_down_exps_weights.data.reshape(32, 2880, 90, 17)
+        ffn_down_data = ffn_down_exps_weights.data.reshape(EXPERT_COUNT, INTERMEDIATE_SIZE, INTERMEDIATE_SIZE//32, 17)  # 17 becayuse 32 4bit+ 1 byte of scale = 17byte
         ffn_down_weight, ffn_down_scale = restore_from_repack_mxfp4_direct(ffn_down_data)
 
         data_to_save[safetensor_layer_common_prefix + "mlp.experts.down_proj_blocks"] = ffn_down_weight
@@ -452,20 +257,20 @@ def convert_q4_gguf_to_safetensor(gguf_file_path:str,
         
         ffn_up_exps_weights = gguf_name_to_tensors[gguf_layer_common_prefix + "ffn_up_exps.weight"]
         assert ffn_up_exps_weights.tensor_type.name == "MXFP4", f"Expected MXFP4, got {ffn_up_exps_weights.tensor_type.name}"
-        ffn_up_data = ffn_up_exps_weights.data.reshape(32, 2880, 90, 17)
+        ffn_up_data = ffn_up_exps_weights.data.reshape(EXPERT_COUNT, EXPERT_FEED_FORWAR_SIZE, EXPERT_FEED_FORWAR_SIZE//32, 17)
         ffn_up_weight, ffn_up_scale = restore_from_repack_mxfp4_direct(ffn_up_data)
         
         ffn_gate_exps_weights = gguf_name_to_tensors[gguf_layer_common_prefix  + "ffn_gate_exps.weight"]
         assert ffn_gate_exps_weights.tensor_type.name == "MXFP4", f"Expected MXFP4, got {ffn_gate_exps_weights.tensor_type.name}"
-        ffn_gate_data = ffn_gate_exps_weights.data.reshape(32, 2880, 90, 17)
+        ffn_gate_data = ffn_gate_exps_weights.data.reshape(EXPERT_COUNT, EXPERT_FEED_FORWAR_SIZE, EXPERT_FEED_FORWAR_SIZE//32, 17)
         ffn_gate_weight, ffn_gate_scale = restore_from_repack_mxfp4_direct(ffn_gate_data)
         
-        merged_scale = torch.empty( (32, 2880*2, 90), dtype=ffn_up_scale.dtype )
+        merged_scale = torch.empty( (EXPERT_COUNT, EXPERT_FEED_FORWAR_SIZE*2, EXPERT_FEED_FORWAR_SIZE//32), dtype=ffn_up_scale.dtype )
         merged_scale[:, ::2, :] = ffn_gate_scale
         merged_scale[:, 1::2, :] = ffn_up_scale
         
         
-        merge_weight =torch.empty( (32, 2880*2, 90, 16 ), dtype=ffn_gate_weight.dtype)
+        merge_weight =torch.empty( (EXPERT_COUNT, EXPERT_FEED_FORWAR_SIZE*2, EXPERT_FEED_FORWAR_SIZE//32, 16 ), dtype=ffn_gate_weight.dtype) # 16 because 32 4bit = 16 byte
         merge_weight[:, ::2, :, :] = ffn_gate_weight
         merge_weight[:, 1::2, :, :] = ffn_up_weight
         
@@ -535,16 +340,16 @@ def debug_dequant_MXF4_dequant(name_block:str, name_scale:str, data_dequant:dict
 
 
 if __name__ == '__main__':
-    # if len(sys.argv) < 2:
-    #     logger.info("Usage: reader.py <path_to_gguf_file>")
-    #     sys.exit(1)
-    # gguf_file_path = sys.argv[1]
+
 
     # #FOR NOW debug
     gguf_file_path = "/home/shouyud/gpt-oss-mega-kernel/gpt-oss/unsloth_q4_1_gguf/gpt-oss-20b-Q4_1.gguf"
     # # read_gguf = read_gguf_file(gguf_file_path)
     data_to_save = {}
-    convert_q4_gguf_to_safetensor(gguf_file_path, data_to_save=data_to_save)
+    convert_q4_gguf_to_safetensor(gguf_file_path, data_to_save=data_to_save,
+                                  TOTAL_LAYER=24,
+                                  EXPERT_COUNT=32, EXPERT_FEED_FORWAR_SIZE=2880, INTERMEDIATE_SIZE=2880
+                                  )
 
 
     safetensor_reference = "/home/shouyud/gpt-oss-mega-kernel/python_code/gpt-oss-evaluation/hf_cache/models--openai--gpt-oss-20b/snapshots/d666cf3b67006cf8227666739edf25164aaffdeb/model-00000-of-00002.safetensors"
@@ -562,55 +367,55 @@ if __name__ == '__main__':
     
     
     #NOTE:, compare it with a safetensor file to see how far the values are off
-    # # Compare other tensors inline
-    # debug_dequant_tensors("lm_head.weight", data_dequant=data_to_save, data_ref=safetensors_data)
-    # debug_dequant_tensors("model.embed_tokens.weight", data_dequant=data_to_save, data_ref=safetensors_data)    
-    # debug_dequant_tensors("model.norm.weight", data_dequant=data_to_save, data_ref=safetensors_data)
+    # Compare other tensors inline
+    debug_dequant_tensors("lm_head.weight", data_dequant=data_to_save, data_ref=safetensors_data)
+    debug_dequant_tensors("model.embed_tokens.weight", data_dequant=data_to_save, data_ref=safetensors_data)    
+    debug_dequant_tensors("model.norm.weight", data_dequant=data_to_save, data_ref=safetensors_data)
 
-    # # save to a certain file
-    # TOTAL_LAYER= 24 # only for now 24
-    # for layer_idx in range(TOTAL_LAYER): # for now
-    #     safetensor_layer_common_prefix = f"model.layers.{layer_idx}."
+    # save to a certain file
+    TOTAL_LAYER= 24 # only for now 24
+    for layer_idx in range(TOTAL_LAYER): # for now
+        safetensor_layer_common_prefix = f"model.layers.{layer_idx}."
 
-    #     debug_dequant_tensors(safetensor_layer_common_prefix + "mlp.experts.down_proj_bias", data_dequant=data_to_save, data_ref=safetensors_data)
-    #     debug_dequant_tensors(safetensor_layer_common_prefix + "mlp.experts.gate_up_proj_bias", data_dequant=data_to_save, data_ref=safetensors_data)
-    #     debug_dequant_tensors(safetensor_layer_common_prefix + "self_attn.sinks", data_dequant=data_to_save, data_ref=safetensors_data)
-    #     debug_dequant_tensors(safetensor_layer_common_prefix + "mlp.router.bias", data_dequant=data_to_save, data_ref=safetensors_data)
-    #     debug_dequant_tensors(safetensor_layer_common_prefix + "mlp.router.weight", data_dequant=data_to_save, data_ref=safetensors_data)
+        debug_dequant_tensors(safetensor_layer_common_prefix + "mlp.experts.down_proj_bias", data_dequant=data_to_save, data_ref=safetensors_data)
+        debug_dequant_tensors(safetensor_layer_common_prefix + "mlp.experts.gate_up_proj_bias", data_dequant=data_to_save, data_ref=safetensors_data)
+        debug_dequant_tensors(safetensor_layer_common_prefix + "self_attn.sinks", data_dequant=data_to_save, data_ref=safetensors_data)
+        debug_dequant_tensors(safetensor_layer_common_prefix + "mlp.router.bias", data_dequant=data_to_save, data_ref=safetensors_data)
+        debug_dequant_tensors(safetensor_layer_common_prefix + "mlp.router.weight", data_dequant=data_to_save, data_ref=safetensors_data)
         
         
-    #     debug_dequant_tensors(safetensor_layer_common_prefix + "self_attn.q_proj.weight", data_dequant=data_to_save, data_ref=safetensors_data)
-    #     debug_dequant_tensors(safetensor_layer_common_prefix + "self_attn.q_proj.bias", data_dequant=data_to_save, data_ref=safetensors_data)
-    #     debug_dequant_tensors(safetensor_layer_common_prefix + "self_attn.k_proj.weight", data_dequant=data_to_save, data_ref=safetensors_data)
-    #     debug_dequant_tensors(safetensor_layer_common_prefix + "self_attn.k_proj.bias", data_dequant=data_to_save, data_ref=safetensors_data)
-    #     debug_dequant_tensors(safetensor_layer_common_prefix + "self_attn.v_proj.weight", data_dequant=data_to_save, data_ref=safetensors_data)
-    #     debug_dequant_tensors(safetensor_layer_common_prefix + "self_attn.v_proj.bias", data_dequant=data_to_save, data_ref=safetensors_data)
-    #     debug_dequant_tensors(safetensor_layer_common_prefix + "self_attn.o_proj.weight", data_dequant=data_to_save, data_ref=safetensors_data)
-    #     debug_dequant_tensors(safetensor_layer_common_prefix + "self_attn.o_proj.bias", data_dequant=data_to_save, data_ref=safetensors_data)
+        debug_dequant_tensors(safetensor_layer_common_prefix + "self_attn.q_proj.weight", data_dequant=data_to_save, data_ref=safetensors_data)
+        debug_dequant_tensors(safetensor_layer_common_prefix + "self_attn.q_proj.bias", data_dequant=data_to_save, data_ref=safetensors_data)
+        debug_dequant_tensors(safetensor_layer_common_prefix + "self_attn.k_proj.weight", data_dequant=data_to_save, data_ref=safetensors_data)
+        debug_dequant_tensors(safetensor_layer_common_prefix + "self_attn.k_proj.bias", data_dequant=data_to_save, data_ref=safetensors_data)
+        debug_dequant_tensors(safetensor_layer_common_prefix + "self_attn.v_proj.weight", data_dequant=data_to_save, data_ref=safetensors_data)
+        debug_dequant_tensors(safetensor_layer_common_prefix + "self_attn.v_proj.bias", data_dequant=data_to_save, data_ref=safetensors_data)
+        debug_dequant_tensors(safetensor_layer_common_prefix + "self_attn.o_proj.weight", data_dequant=data_to_save, data_ref=safetensors_data)
+        debug_dequant_tensors(safetensor_layer_common_prefix + "self_attn.o_proj.bias", data_dequant=data_to_save, data_ref=safetensors_data)
 
         
-    #     debug_dequant_tensors(safetensor_layer_common_prefix + "post_attention_layernorm.weight", data_dequant=data_to_save, data_ref=safetensors_data)
-    #     debug_dequant_tensors(safetensor_layer_common_prefix + "input_layernorm.weight", data_dequant=data_to_save, data_ref=safetensors_data)
+        debug_dequant_tensors(safetensor_layer_common_prefix + "post_attention_layernorm.weight", data_dequant=data_to_save, data_ref=safetensors_data)
+        debug_dequant_tensors(safetensor_layer_common_prefix + "input_layernorm.weight", data_dequant=data_to_save, data_ref=safetensors_data)
 
         
     
-    #     debug_dequant_MXF4_dequant(
-    #         safetensor_layer_common_prefix + "mlp.experts.down_proj_blocks",
-    #         safetensor_layer_common_prefix + "mlp.experts.down_proj_scales",
-    #         data_dequant=data_to_save,data_ref=safetensors_data
-    #     )
+        debug_dequant_MXF4_dequant(
+            safetensor_layer_common_prefix + "mlp.experts.down_proj_blocks",
+            safetensor_layer_common_prefix + "mlp.experts.down_proj_scales",
+            data_dequant=data_to_save,data_ref=safetensors_data
+        )
 
         
-    #     debug_dequant_MXF4_dequant(
-    #         safetensor_layer_common_prefix  + "mlp.experts.gate_up_proj_blocks",
-    #         safetensor_layer_common_prefix  + "mlp.experts.gate_up_proj_scales",
-    #           data_dequant=data_to_save,data_ref=safetensors_data
-    #     )
+        debug_dequant_MXF4_dequant(
+            safetensor_layer_common_prefix  + "mlp.experts.gate_up_proj_blocks",
+            safetensor_layer_common_prefix  + "mlp.experts.gate_up_proj_scales",
+              data_dequant=data_to_save,data_ref=safetensors_data
+        )
     
-    # #NOTE: TODO: 
-    # # do a very debug operation
-    # # replace token_embd.weight in data_to_Save with the safetensors_data
-    # data_to_save["model.embed_tokens.weight"] = safetensors_data["model.embed_tokens.weight"].clone()
+    #NOTE: TODO: 
+    # do a very debug operation
+    # replace token_embd.weight in data_to_Save with the safetensors_data
+    data_to_save["model.embed_tokens.weight"] = safetensors_data["model.embed_tokens.weight"].clone()
 
 
     # also save a json file
