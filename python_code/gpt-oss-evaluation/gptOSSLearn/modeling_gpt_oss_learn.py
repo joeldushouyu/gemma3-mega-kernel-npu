@@ -234,8 +234,7 @@ class GptOssExpertsLearn(GptOssExperts):
             return next_states_out
             
             
-
-    def forward(self, hidden_states: torch.Tensor, router_indices=None, routing_weights=None) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, router_indices=None, routing_weights=None, layer_id=-1, prefill_data_to_save_tensors:  Optional[dict[str, torch.Tensor]]=None) -> torch.Tensor:
         """
         When training it is more efficient to just loop over the experts and compute the output for each expert
         as otherwise the memory would explode.
@@ -249,88 +248,199 @@ class GptOssExpertsLearn(GptOssExperts):
         Returns:
             torch.Tensor
         """
-        
-        if self.first_time:
-            self.first_time = False
-            self.gate_proj = self.gate_up_proj[..., ::2]
-            self.up_proj =  self.gate_up_proj[..., 1::2]
-            
-            self.gate_proj_bias = self.gate_up_proj_bias[..., ::2]
-            self.up_proj_bias = self.gate_up_proj_bias[..., 1::2]
-                        
-        
-        
-        res_np =  self.numpy_forward(tensor_to_numpy(hidden_states), tensor_to_numpy(router_indices), tensor_to_numpy(routing_weights))
-        
-        # res_torch = numpy_to_tensor(res_np, dtype=hidden_states.dtype)
-        
-        
         batch_size = hidden_states.shape[0]
-        hidden_states = hidden_states.reshape(-1, self.hidden_size)  #[batch_size, seq_len. hidden_size] -> [batch*seq_len, hidden_size]# (num_tokens, hidden_size)
+        hidden_states = hidden_states.reshape(-1, self.hidden_size)  # (num_tokens, hidden_size)
         num_experts = routing_weights.shape[1]
 
-        #Note: Pure inference
-        hidden_states = hidden_states.repeat(num_experts, 1)  # duplicate to exntend [batch*seq_len, hidden_size] to [num_expert*batch*seq_len, hidden_size]
-        hidden_states = hidden_states.view(num_experts, -1, self.hidden_size)  #reshape to [total_num_expert, batch*seq_len, hidden_size]
-        # self.gate_up_project is [total_num_expect, hidden_size, intermediate_size*2]
-        # self.gate_up_project_bias is [total_num_expert, intermediate_size*2]
-       
+        # for debugging, we do it per expert instead
+        if  prefill_data_to_save_tensors is not None and layer_id == 0:
+            expert_id_to_L_debug:dict[int, list[int]] = {}
+            
+            
+            
+            for l_index in range(router_indices.shape[0]):
+                for k_index in range(router_indices.shape[1]):
+                    expert_id = router_indices[l_index][k_index].item()
+                    if expert_id not in expert_id_to_L_debug:
+                        expert_id_to_L_debug[expert_id] = []
+                    expert_id_to_L_debug[expert_id].append(l_index)
 
-        # gate_up = torch.bmm(hidden_states, self.gate_up_proj) + self.gate_up_proj_bias[..., None, :]  # result in [total_num_expert, seq_len, intermediate_size*2]
-        # # Note, it is intermediate_size*2 because of both gate and up
+            # print out the expert_id_to_L_debug
+            for expert_id, L_debug in expert_id_to_L_debug.items():
+                print(f"Expert {expert_id}: selected {len(L_debug)} tokens")
+                # print out the actual token ids
+                print(f"  Token indices: {L_debug}")
+            # Now, do a MLP stuff per expert
+            for expert_id, L_debug in expert_id_to_L_debug.items():
+                hidden_states_expert = hidden_states[L_debug, :]  # (num_selected_tokens, hidden_size)
+                
+                # print out hidden_states_expert matrix
+                print("Expert ID:", expert_id)
+                print(f"  hidden_states_expert shape: {hidden_states_expert.shape}")
+                print(f"  hidden_states_expert: {hidden_states_expert}")
+                
+                
+                # doe the mlp for 
+                #NOTE: gate, up is already transposed
+                W_gate = self.gate_up_proj[..., ::2]   # take even columns
+                W_up   = self.gate_up_proj[..., 1::2]  # take odd columns
 
-        # #Note: it is doing a interleave, not simple split here  #TODO: avoid mix by rearrange the weight for inference?
-        # gate, up = gate_up[..., ::2], gate_up[..., 1::2]
+                expert_gate_res_no_bias = torch.mm(hidden_states_expert, W_gate[expert_id]) 
+                expert_up_res_no_bias = torch.mm(hidden_states_expert, W_up[expert_id]) 
+                prefill_data_to_save_tensors[f"layer_{layer_id}_expert_{expert_id}_gate"] =expert_gate_res_no_bias.contiguous()
+                prefill_data_to_save_tensors[f"layer_{layer_id}_expert_{expert_id}_up"] = expert_up_res_no_bias.contiguous()
+                
 
-        gate = torch.bmm(hidden_states, self.gate_proj) + self.gate_proj_bias[..., None, :]
-        up: torch.Tensor = torch.bmm(hidden_states, self.up_proj) + self.up_proj_bias[..., None, :]
+        hidden_states = hidden_states.repeat(num_experts, 1)
+        hidden_states = hidden_states.view(num_experts, -1, self.hidden_size)
+        gate_up = torch.bmm(hidden_states, self.gate_up_proj) + self.gate_up_proj_bias[..., None, :]
+        gate, up = gate_up[..., ::2], gate_up[..., 1::2]
+        if prefill_data_to_save_tensors is not None:
 
-        # # assert gate_t similar to gate
-        # assert torch.allclose(gate_t, gate, atol=1e-6)
-        # assert torch.allclose(up_t, up, atol=1e-6)
-        
+            prefill_data_to_save_tensors[f"layer_{layer_id}_gate"] = gate.permute(1, 0, 2).clone().contiguous()
+            prefill_data_to_save_tensors[f"layer_{layer_id}_up"] = up.permute(1, 0, 2).clone().contiguous()
+            
+            if layer_id == 0 :
+                W_gate = self.gate_up_proj[..., ::2]   # take even columns
+                W_up   = self.gate_up_proj[..., 1::2]  # take odd columns
+                
+                # W_gate, W_up is already being transposed, so we need to transpose it back
+                W_gate = W_gate.transpose(-1, -2)
+                W_up = W_up.transpose(-1, -2)
+                
+                sub = W_gate[0][:64, :256]
+                np.savetxt("tensor_slice.txt", sub.float().numpy(), fmt="%.6f", delimiter="\t")
+                prefill_data_to_save_tensors[f"layer_{layer_id}_gate_weight"] = W_gate.clone().contiguous()
+                prefill_data_to_save_tensors[f"layer_{layer_id}_up_weight"] = W_up.clone().contiguous()
+                
+                W_down = self.down_proj.clone().contiguous() 
+                W_down = W_down.transpose(-1,-2).contiguous() # transpose it back
+                prefill_data_to_save_tensors[f"lauer_{layer_id}_down_weight"] = W_down
+                
         
         gate = gate.clamp(min=None, max=self.limit)
         up = up.clamp(min=-self.limit, max=self.limit)
+        if prefill_data_to_save_tensors is not None:
+            prefill_data_to_save_tensors[f"layer_{layer_id}_gate_clamped"] = gate.permute(1, 0, 2).contiguous().clone() #TODO: is it correct here?
+            prefill_data_to_save_tensors[f"layer_{layer_id}_up_clamped"] = up.permute(1, 0, 2).contiguous().clone()
         glu = gate * torch.sigmoid(gate * self.alpha)
+        if prefill_data_to_save_tensors is not None:
+            prefill_data_to_save_tensors["layer_{layer_id}_glu"] = glu.permute(1,0,2).contiguous().clone()
         
-        # down_project is [total_expert, intermediate_size, hidden_size]
         next_states = torch.bmm(((up + 1) * glu), self.down_proj)
-        
-
+        if prefill_data_to_save_tensors is not None:
+            res = (up + 1) * glu
+            
+            prefill_data_to_save_tensors[f"layer_{layer_id}_before_down"] = res.permute(1, 0, 2).clone().contiguous()
         next_states = next_states + self.down_proj_bias[..., None, :]
         
+        if prefill_data_to_save_tensors is not None:
+            prefill_data_to_save_tensors[f"layer_{layer_id}_down"] = next_states.permute(1, 0,2).contiguous().clone()
+            
+            
+        next_states = next_states.view(num_experts, batch_size, -1, self.hidden_size)
+        next_states = next_states * routing_weights.transpose(0, 1).view(num_experts, batch_size, -1)[..., None]
+        next_states = next_states.sum(dim=0)
         
-        next_states = next_states.view(num_experts, batch_size, -1, self.hidden_size)  # this store it back to [total_expert, batch, seq_len, hidden_size]
-        #recall routing_weights is [batch_size * seq_len, num_experts)]
-        
-        routing_weight_T = routing_weights.transpose(0, 1) #[ num_experts, batch_size * seq_len,]
-        routing_weight_T= routing_weight_T.view(num_experts, batch_size, -1) # reorder to [total_expert, batch_size, seq_len]
-        
-        
-        next_states = next_states * routing_weight_T[..., None]  # first expand routing_weight_t to [total_Expert, batch_size, seq_len, hidden_size], then do a element_wise multiplcation
-        # next_state is still [total_expert, batch, seq_len, hidden_size]
-        next_states = next_states.sum(dim=0)  # summ all expert(AKA sum the topK expert, because all no-select expert has routing_weight_T of zero, which then element-wise multiplcation result in 0.0)
-
-        # at this point, next_states is then shrink back to [batch, seq_len, hidden_size]
-        
-        
-        
-        # check if res_torch is same to next_states
-        # print out the four erros
-        next_states_np = tensor_to_numpy(next_states)
-        L1_err = get_relativeL1(res_np, next_states_np)
-        L2_err = get_relativeL2(res_np, next_states_np)
-        rmse_err = get_rmse(res_np, next_states_np)
-        cosine_sim = get_cosine_similarity(res_np, next_states_np)
-
-        print(f"L1 Error: {L1_err}")
-        print(f"L2 Error: {L2_err}")
-        print(f"RMSE Error: {rmse_err}")
-        print(f"Cosine Similarity: {cosine_sim}")
-
-        # assert torch.allclose(res_torch, next_states, atol=1e-6)
+        if prefill_data_to_save_tensors is not None:
+            prefill_data_to_save_tensors[f"layer_{layer_id}_apply_score"] = next_states.clone()        
         return next_states
+    # def forward(self, hidden_states: torch.Tensor, router_indices=None, routing_weights=None) -> torch.Tensor:
+    #     """
+    #     When training it is more efficient to just loop over the experts and compute the output for each expert
+    #     as otherwise the memory would explode.
+
+    #     For inference we can sacrifice some memory and compute the output for all experts at once. By repeating the inputs.
+
+    #     Args:
+    #         hidden_states (torch.Tensor): (batch_size, seq_len, hidden_size)
+    #         selected_experts (torch.Tensor): (batch_size * token_num, top_k)
+    #         routing_weights (torch.Tensor): (batch_size * token_num, num_experts)
+    #     Returns:
+    #         torch.Tensor
+    #     """
+        
+    #     if self.first_time:
+    #         self.first_time = False
+    #         self.gate_proj = self.gate_up_proj[..., ::2]
+    #         self.up_proj =  self.gate_up_proj[..., 1::2]
+            
+    #         self.gate_proj_bias = self.gate_up_proj_bias[..., ::2]
+    #         self.up_proj_bias = self.gate_up_proj_bias[..., 1::2]
+                        
+        
+        
+    #     # res_np =  self.numpy_forward(tensor_to_numpy(hidden_states), tensor_to_numpy(router_indices), tensor_to_numpy(routing_weights))
+        
+    #     # # res_torch = numpy_to_tensor(res_np, dtype=hidden_states.dtype)
+        
+        
+    #     batch_size = hidden_states.shape[0]
+    #     hidden_states = hidden_states.reshape(-1, self.hidden_size)  #[batch_size, seq_len. hidden_size] -> [batch*seq_len, hidden_size]# (num_tokens, hidden_size)
+    #     num_experts = routing_weights.shape[1]
+
+    #     #Note: Pure inference
+    #     hidden_states = hidden_states.repeat(num_experts, 1)  # duplicate to exntend [batch*seq_len, hidden_size] to [num_expert*batch*seq_len, hidden_size]
+    #     hidden_states = hidden_states.view(num_experts, -1, self.hidden_size)  #reshape to [total_num_expert, batch*seq_len, hidden_size]
+    #     # self.gate_up_project is [total_num_expect, hidden_size, intermediate_size*2]
+    #     # self.gate_up_project_bias is [total_num_expert, intermediate_size*2]
+       
+
+    #     # gate_up = torch.bmm(hidden_states, self.gate_up_proj) + self.gate_up_proj_bias[..., None, :]  # result in [total_num_expert, seq_len, intermediate_size*2]
+    #     # # Note, it is intermediate_size*2 because of both gate and up
+
+    #     # #Note: it is doing a interleave, not simple split here  #TODO: avoid mix by rearrange the weight for inference?
+    #     # gate, up = gate_up[..., ::2], gate_up[..., 1::2]
+
+    #     gate = torch.bmm(hidden_states, self.gate_proj) + self.gate_proj_bias[..., None, :]
+    #     up: torch.Tensor = torch.bmm(hidden_states, self.up_proj) + self.up_proj_bias[..., None, :]
+
+    #     # # assert gate_t similar to gate
+    #     # assert torch.allclose(gate_t, gate, atol=1e-6)
+    #     # assert torch.allclose(up_t, up, atol=1e-6)
+        
+        
+    #     gate = gate.clamp(min=None, max=self.limit)
+    #     up = up.clamp(min=-self.limit, max=self.limit)
+    #     glu = gate * torch.sigmoid(gate * self.alpha)
+        
+    #     # down_project is [total_expert, intermediate_size, hidden_size]
+    #     next_states = torch.bmm(((up + 1) * glu), self.down_proj)
+        
+
+    #     next_states = next_states + self.down_proj_bias[..., None, :]
+        
+        
+    #     next_states = next_states.view(num_experts, batch_size, -1, self.hidden_size)  # this store it back to [total_expert, batch, seq_len, hidden_size]
+    #     #recall routing_weights is [batch_size * seq_len, num_experts)]
+        
+    #     routing_weight_T = routing_weights.transpose(0, 1) #[ num_experts, batch_size * seq_len,]
+    #     routing_weight_T= routing_weight_T.view(num_experts, batch_size, -1) # reorder to [total_expert, batch_size, seq_len]
+        
+        
+    #     next_states = next_states * routing_weight_T[..., None]  # first expand routing_weight_t to [total_Expert, batch_size, seq_len, hidden_size], then do a element_wise multiplcation
+    #     # next_state is still [total_expert, batch, seq_len, hidden_size]
+    #     next_states = next_states.sum(dim=0)  # summ all expert(AKA sum the topK expert, because all no-select expert has routing_weight_T of zero, which then element-wise multiplcation result in 0.0)
+
+    #     # at this point, next_states is then shrink back to [batch, seq_len, hidden_size]
+        
+        
+        
+    #     # # check if res_torch is same to next_states
+    #     # # print out the four erros
+    #     # next_states_np = tensor_to_numpy(next_states)
+    #     # L1_err = get_relativeL1(res_np, next_states_np)
+    #     # L2_err = get_relativeL2(res_np, next_states_np)
+    #     # rmse_err = get_rmse(res_np, next_states_np)
+    #     # cosine_sim = get_cosine_similarity(res_np, next_states_np)
+
+    #     # print(f"L1 Error: {L1_err}")
+    #     # print(f"L2 Error: {L2_err}")
+    #     # print(f"RMSE Error: {rmse_err}")
+    #     # print(f"Cosine Similarity: {cosine_sim}")
+
+    #     # assert torch.allclose(res_torch, next_states, atol=1e-6)
+    #     return next_states
 
 
 class GptOssTopKRouterLearn(nn.Module):
@@ -346,75 +456,100 @@ class GptOssTopKRouterLearn(nn.Module):
         self.router_scores_cache = None
         self.router_indices_cache = None
         self.prev_seq_len = None
-    def forward(self, hidden_states):
-
-
-        batch_size = hidden_states.shape[0]
-        if self.prev_seq_len is None:
-            self.prev_seq_len = hidden_states.shape[1]            
-            # input is [batch_size, seq_len, hidden_size]
-            hidden_states = hidden_states.reshape(-1, self.hidden_dim)  # change to [batch_size*seq_len, hidden_size]
-            # weight should be [num_expert, hidden_size]  #Note: the Linear will do a transpose on the weight matrix
-            router_logits = F.linear(hidden_states, self.weight, self.bias)  # (batch_size*seq_len, num_experts)
-            router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)  # (batch_size*seq_len, top_k)
-            router_top_value = torch.nn.functional.softmax(router_top_value, dim=1, dtype=router_top_value.dtype)
-            router_scores = torch.zeros_like(router_logits).scatter_(1, router_indices, router_top_value)
-            
-            self.router_scores_cache = router_scores.clone()
-            self.router_indices_cache = router_indices.clone()
-
-            
-            return router_scores, router_indices
-        else: 
+    def forward(self, hidden_states, decode_data_to_save_tensors:None|dict[str, torch.Tensor]=None, layer_id:int=-1, prefill_data_to_save_tensors:  Optional[dict[str, torch.Tensor]] = None,):
+        hidden_states = hidden_states.reshape(-1, self.hidden_dim)
+        router_logits = F.linear(hidden_states, self.weight, self.bias)  # (seq_len, num_experts)
+        if prefill_data_to_save_tensors is not None:
+            prefill_data_to_save_tensors[f"layer_{layer_id}_router_logits"] = router_logits.clone()
+        router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)  # (seq_len, top_k)
+        if prefill_data_to_save_tensors is not None:
+            prefill_data_to_save_tensors[f"layer_{layer_id}_top_k_value"] = router_top_value.clone()
         
-            # at decode, only need to care the newest token
-            old_seq_len = self.prev_seq_len
-            seq_len =  hidden_states.shape[1]
-            self.prev_seq_len = seq_len           
-            # now change hidden_states to [batch_size*seq_len, hidden_size]
-            hidden_states = hidden_states.reshape(-1, self.hidden_dim)
+        router_top_value = torch.nn.functional.softmax(router_top_value, dim=1, dtype=router_top_value.dtype)
+        if prefill_data_to_save_tensors is not None:
+            prefill_data_to_save_tensors[f"layer_{layer_id}_top_k_value_after_softmax"] = router_top_value.clone()
+            prefill_data_to_save_tensors[f"layer_{layer_id}_top_k_value_indices"] = router_indices.clone()
+        router_scores = torch.zeros_like(router_logits).scatter_(1, router_indices, router_top_value)
+        return router_scores, router_indices
+        # batch_size = hidden_states.shape[0]
+        # if self.prev_seq_len is None:
+        #     self.prev_seq_len = hidden_states.shape[1]            
+        #     # input is [batch_size, seq_len, hidden_size]
+        #     hidden_states = hidden_states.reshape(-1, self.hidden_dim)  # change to [batch_size*seq_len, hidden_size]
+        #     # weight should be [num_expert, hidden_size]  #Note: the Linear will do a transpose on the weight matrix
+        #     router_logits = F.linear(hidden_states, self.weight, self.bias)  # (batch_size*seq_len, num_experts)
+        #     router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)  # (batch_size*seq_len, top_k)
+        #     router_top_value = torch.nn.functional.softmax(router_top_value, dim=1, dtype=router_top_value.dtype)
+        #     router_scores = torch.zeros_like(router_logits).scatter_(1, router_indices, router_top_value)
             
-            
-            hidden_states_decode = None
-            
-            for decode_row_idx in range( old_seq_len, batch_size*seq_len, seq_len ):
-                if hidden_states_decode is None:
-                    hidden_states_decode = hidden_states[decode_row_idx:decode_row_idx+1, :]
-                else:
-                    hidden_states_decode = torch.cat( (hidden_states_decode, hidden_states[decode_row_idx:decode_row_idx+1, :]), dim=0)
+        #     self.router_scores_cache = router_scores.clone()
+        #     self.router_indices_cache = router_indices.clone()
 
-            router_logits_decode = F.linear(hidden_states_decode, self.weight, self.bias)
-            router_top_value_decode, router_indices_decode =torch.topk(router_logits_decode, self.top_k, dim=-1) 
-            router_top_value_decode = torch.nn.functional.softmax(router_top_value_decode, dim=1, dtype=router_top_value_decode.dtype)  
-            router_scores_decode = torch.zeros_like(router_logits_decode).scatter_(1, router_indices_decode, router_top_value_decode)
+            
+        #     return router_scores, router_indices
+        # else: 
+        
+        #     # at decode, only need to care the newest token
+        #     old_seq_len = self.prev_seq_len
+        #     seq_len =  hidden_states.shape[1]
+        #     self.prev_seq_len = seq_len           
+        #     # now change hidden_states to [batch_size*seq_len, hidden_size]
+        #     hidden_states = hidden_states.reshape(-1, self.hidden_dim)
             
             
+        #     hidden_states_decode = None
             
-            # for now, assert batch_Size = 1
-            assert batch_size == 1    
-            router_scores = self.router_scores_cache.clone()
-            router_indices = self.router_indices_cache.clone()
+        #     for decode_row_idx in range( old_seq_len, batch_size*seq_len, seq_len ):
+        #         if hidden_states_decode is None:
+        #             hidden_states_decode = hidden_states[decode_row_idx:decode_row_idx+1, :]
+        #         else:
+        #             hidden_states_decode = torch.cat( (hidden_states_decode, hidden_states[decode_row_idx:decode_row_idx+1, :]), dim=0)
 
-            router_scores = torch.cat((router_scores, router_scores_decode), dim=0)
-            router_indices = torch.cat((router_indices, router_indices_decode), dim=0)
+
+        #     if decode_data_to_save_tensors is not None:
+        #         decode_data_to_save_tensors[f"decode_router_layer_{layer_id}_hidden_states"] = hidden_states_decode.clone()
+                
+        #     router_logits_decode = F.linear(hidden_states_decode, self.weight, self.bias)
+        #     if decode_data_to_save_tensors is not None:
+        #         decode_data_to_save_tensors[f"decode_router_layer_{layer_id}_router_logits"] = router_logits_decode.clone()
+
+        #     router_top_value_decode, router_indices_decode =torch.topk(router_logits_decode, self.top_k, dim=-1) 
+
+        #     if decode_data_to_save_tensors is not None:
+        #         decode_data_to_save_tensors[f"decode_router_layer_{layer_id}_router_top_value"] = router_top_value_decode.clone()
+        #         decode_data_to_save_tensors[f"decode_router_layer_{layer_id}_router_indices"] = router_indices_decode.clone()
+
+        #     router_top_value_decode = torch.nn.functional.softmax(router_top_value_decode, dim=1, dtype=router_top_value_decode.dtype)  
+        #     router_scores_decode = torch.zeros_like(router_logits_decode).scatter_(1, router_indices_decode, router_top_value_decode)
+
+        #     if decode_data_to_save_tensors is not None:
+        #         decode_data_to_save_tensors[f"decode_router_layer_{layer_id}_router_scores"] = router_scores_decode.clone()
+
+        #     # for now, assert batch_Size = 1
+        #     assert batch_size == 1    
+        #     router_scores = self.router_scores_cache.clone()
+        #     router_indices = self.router_indices_cache.clone()
+
+        #     router_scores = torch.cat((router_scores, router_scores_decode), dim=0)
+        #     router_indices = torch.cat((router_indices, router_indices_decode), dim=0)
 
 
-            self.router_indices_cache = router_indices.clone()
-            self.router_scores_cache = router_scores.clone()
-            self.prev_seq_len = seq_len
+        #     self.router_indices_cache = router_indices.clone()
+        #     self.router_scores_cache = router_scores.clone()
+        #     self.prev_seq_len = seq_len
             
-            return router_scores, router_indices
+        #     return router_scores, router_indices
 
 @use_kernel_forward_from_hub("MegaBlocksMoeMLP")
 class GptOssMLPLearn(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.router = GptOssTopKRouterLearn(config)
+        self.router = GptOssTopKRouterLearn(config=config)
         self.experts = GptOssExpertsLearn(config)
 
-    def forward(self, hidden_states):
-        router_scores, router_indices = self.router(hidden_states)  # (num_experts, seq_len)
-        routed_out = self.experts(hidden_states, router_indices=router_indices, routing_weights=router_scores)
+    def forward(self, hidden_states, decode_data_to_save_tensors:None|dict[str, torch.Tensor]=None, layer_id:int=-1, prefill_data_to_save_tensors:  Optional[dict[str, torch.Tensor]] = None):
+        router_scores, router_indices = self.router(hidden_states, decode_data_to_save_tensors=decode_data_to_save_tensors, layer_id=layer_id,prefill_data_to_save_tensors=prefill_data_to_save_tensors)  # (num_experts, seq_len)
+        routed_out = self.experts(hidden_states, router_indices=router_indices, routing_weights=router_scores,  layer_id=layer_id,prefill_data_to_save_tensors=prefill_data_to_save_tensors)
         return routed_out, router_scores
 
 
@@ -455,18 +590,67 @@ class GptOssAttentionLearn(nn.Module):
         attention_mask: Optional[torch.Tensor],
         past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        layer_id:int=-1,
+        prefill_data_to_save_tensors:  Optional[dict[str, torch.Tensor]] = None,        
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         input_shape = hidden_states.shape[:-1]
+        
+        hidden_states_before_reshape = hidden_states.clone()
         hidden_shape = (*input_shape, -1, self.head_dim)
 
+        if prefill_data_to_save_tensors is not None:
+            prefill_data_to_save_tensors[f"layer_{layer_id}_k_weight"] = self.k_proj.weight.clone()
+        
         query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
+        if prefill_data_to_save_tensors is not None:
+    
+            # no-bias QKV
+            query_states_nobias = F.linear(hidden_states_before_reshape, self.q_proj.weight, bias=None)
+            key_states_nobias   = F.linear(hidden_states_before_reshape, self.k_proj.weight, bias=None)
+            value_states_nobias = F.linear(hidden_states_before_reshape, self.v_proj.weight, bias=None)
+
+            # --- restored versions (back to [batch, seq, head*dim]) ---
+            q_restored = F.linear(hidden_states_before_reshape, self.q_proj.weight, bias=self.q_proj.bias)
+            k_restored = F.linear(hidden_states_before_reshape, self.k_proj.weight, bias=self.k_proj.bias)
+            v_restored = F.linear(hidden_states_before_reshape, self.v_proj.weight, bias=self.v_proj.bias)
+
+
+            prefill_data_to_save_tensors[f"layer_{layer_id}_q_proj"] = q_restored.clone()
+            prefill_data_to_save_tensors[f"layer_{layer_id}_k_proj"] = k_restored.clone()
+            prefill_data_to_save_tensors[f"layer_{layer_id}_v_proj"] = v_restored.clone()
+
+            prefill_data_to_save_tensors[f"layer_{layer_id}_q_proj_no_bias"] = query_states_nobias.clone()
+            prefill_data_to_save_tensors[f"layer_{layer_id}_k_proj_no_bias"] = key_states_nobias.clone()
+            prefill_data_to_save_tensors[f"layer_{layer_id}_v_proj_no_bias"] = value_states_nobias.clone()       
+                 
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        if prefill_data_to_save_tensors is not None:
+            q = query_states.clone()
+            k = key_states.clone()
+            
+            # query_states and key_states are in [batch, num_heads, seq_len, head_dim] format
+            q = q.permute(0, 2, 1, 3)                  # [batch, seq_len, num_heads, head_dim]
+            k = k.permute(0, 2, 1, 3)                  # [batch, seq_len, num_heads, head_dim]
+            
+            # Use actual dimensions instead of hardcoding
+            batch_size, seq_len = q.shape[0], q.shape[1]
+            q = q.reshape(batch_size, seq_len, -1)     # [batch, seq_len, num_heads * head_dim]
+            k = k.reshape(batch_size, seq_len, -1)     # [batch, seq_len, num_heads * head_dim]
 
+            # save merged format
+            prefill_data_to_save_tensors[f"layer_{layer_id}_q_rope"] = q.clone()
+            prefill_data_to_save_tensors[f"layer_{layer_id}_k_rope"] = k.clone()
+            
+            prefill_data_to_save_tensors[f"layer_{layer_id}_cos"] = cos.clone()
+            prefill_data_to_save_tensors[f"layer_{layer_id}_sin"] = sin.clone()
+            
+
+            
         if past_key_values is not None:
             cache_kwargs = {"cache_position": cache_position}
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
@@ -489,7 +673,15 @@ class GptOssAttentionLearn(nn.Module):
         )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+    
+        if prefill_data_to_save_tensors is not None:
+            prefill_data_to_save_tensors[f"layer_{layer_id}_att_hidden_out"] = attn_output.clone() 
+            attn_output_nobias = F.linear(attn_output, self.o_proj.weight, bias=None)
+            prefill_data_to_save_tensors[f"layer_{layer_id}_attn_out_no_bias"] = attn_output_nobias.clone()
+            
         attn_output = self.o_proj(attn_output)
+        if prefill_data_to_save_tensors is not None:
+            prefill_data_to_save_tensors[f"layer_{layer_id}_attn_out"] = attn_output.clone()
         return attn_output, attn_weights
 
 
@@ -503,7 +695,7 @@ class GptOssDecoderLayerLearn(GradientCheckpointingLayer):
         self.post_attention_layernorm = GptOssRMSNormLearn(config.hidden_size, eps=config.rms_norm_eps)
         self.attention_type = config.layer_types[layer_idx]
 
-    @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -513,10 +705,16 @@ class GptOssDecoderLayerLearn(GradientCheckpointingLayer):
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
+        decode_data_to_save_tensors:None|dict[str, torch.Tensor]=None, layer_id:int=-1,
+        prefill_data_to_save_tensors:  Optional[dict[str, torch.Tensor]] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
         residual = hidden_states
+        if prefill_data_to_save_tensors is not None:
+            prefill_data_to_save_tensors[f"layer_{layer_id}_before_input_layernorm"] = hidden_states.clone()
         hidden_states = self.input_layernorm(hidden_states)
+        if prefill_data_to_save_tensors is not None:
+            prefill_data_to_save_tensors[f"layer_{layer_id}_after_input_layernorm"] = hidden_states.clone()
         # Self Attention
         hidden_states, _ = self.self_attn(
             hidden_states=hidden_states,
@@ -526,15 +724,30 @@ class GptOssDecoderLayerLearn(GradientCheckpointingLayer):
             use_cache=use_cache,
             cache_position=cache_position,
             position_embeddings=position_embeddings,
+            prefill_data_to_save_tensors=prefill_data_to_save_tensors,
+            layer_id=layer_id,
             **kwargs,
         )
+        if prefill_data_to_save_tensors is not None:
+            prefill_data_to_save_tensors[f"layer_{layer_id}_after_attention"] = hidden_states.clone()         
         hidden_states = residual + hidden_states
-
+        if prefill_data_to_save_tensors is not None:
+            prefill_data_to_save_tensors[f"layer_{layer_id}_after_residual_1"] = hidden_states.clone() 
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states, _ = self.mlp(hidden_states)  # diff with llama: router scores
+        
+        if prefill_data_to_save_tensors is not None:
+            prefill_data_to_save_tensors[f"layer_{layer_id}_after_post_layernorm"] = hidden_states.clone()
+        
+        hidden_states, _ = self.mlp(hidden_states, decode_data_to_save_tensors, layer_id,prefill_data_to_save_tensors)  # diff with llama: router scores
+        
+        if prefill_data_to_save_tensors is not None:
+            prefill_data_to_save_tensors[f"layer_{layer_id}_after_mlp"] = hidden_states.clone()
+        
         hidden_states = residual + hidden_states
+        if prefill_data_to_save_tensors is not None:
+            prefill_data_to_save_tensors[f"layer_{layer_id}_after_residual_2"] = hidden_states.clone()
         return hidden_states
 
 
@@ -624,6 +837,8 @@ class GptOssModelLearn(GptOssPreTrainedModel):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        decode_data_to_save_tensors: Optional[dict[str, torch.Tensor]] = None,
+        prefill_data_to_save_tensors:  Optional[dict[str, torch.Tensor]] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> MoeModelOutputWithPast:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -634,7 +849,9 @@ class GptOssModelLearn(GptOssPreTrainedModel):
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
-
+        if prefill_data_to_save_tensors is not None:
+            prefill_data_to_save_tensors["after_input_embedding"] = inputs_embeds.clone()
+        
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
             cache_position = torch.arange(
@@ -658,9 +875,17 @@ class GptOssModelLearn(GptOssPreTrainedModel):
             }
 
         hidden_states = inputs_embeds
+        
+        if prefill_data_to_save_tensors is not None:
+            prefill_data_to_save_tensors["rope_invert_freq"] = self.rotary_emb.inv_freq
+            print(f"rope_scaling {self.rotary_emb.attention_scaling}")
+            #prefill_data_to_save_tensors["rope_scaling"] = self.rotary_emb.attention_scaling
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        if prefill_data_to_save_tensors is not None:
+            prefill_data_to_save_tensors["position_embeddings_cos"]=position_embeddings[0].contiguous()
+            prefill_data_to_save_tensors["position_embeddings_sin"]=position_embeddings[1].contiguous()
 
-        for decoder_layer in self.layers:
+        for idx,  decoder_layer in enumerate(self.layers):
             hidden_states = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask_mapping[decoder_layer.attention_type],
@@ -669,9 +894,16 @@ class GptOssModelLearn(GptOssPreTrainedModel):
                 use_cache=use_cache,
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
+                decode_data_to_save_tensors=decode_data_to_save_tensors,
+                prefill_data_to_save_tensors=prefill_data_to_save_tensors,
+                layer_id=idx,
                 **kwargs,
             )
+
         hidden_states = self.norm(hidden_states)
+        if prefill_data_to_save_tensors is not None:
+            prefill_data_to_save_tensors["output_norm"] =  hidden_states.clone()        
+        
         return MoeModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values,
@@ -714,6 +946,8 @@ class GptOssForCausalLMLearn(GptOssPreTrainedModel, GenerationMixin):
         output_router_logits: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
+        decode_data_to_save_tensors: Optional[dict[str, torch.Tensor]] = None,
+        prefill_data_to_save_tensors:  Optional[dict[str, torch.Tensor]] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> MoeCausalLMOutputWithPast:
         r"""
@@ -753,6 +987,8 @@ class GptOssForCausalLMLearn(GptOssPreTrainedModel, GenerationMixin):
             use_cache=use_cache,
             output_router_logits=output_router_logits,
             cache_position=cache_position,
+            decode_data_to_save_tensors=decode_data_to_save_tensors,
+            prefill_data_to_save_tensors=prefill_data_to_save_tensors,
             **kwargs,
         )
 
@@ -760,7 +996,8 @@ class GptOssForCausalLMLearn(GptOssPreTrainedModel, GenerationMixin):
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
-
+        if prefill_data_to_save_tensors is not None:
+            prefill_data_to_save_tensors["logits"] = logits.clone()
         loss = None
         if labels is not None:
             loss = self.loss_function(logits, labels, self.vocab_size, **kwargs)

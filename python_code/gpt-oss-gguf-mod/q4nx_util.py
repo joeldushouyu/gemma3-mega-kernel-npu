@@ -439,6 +439,21 @@ def convert_mxfp4_gguf_data_to_q4nx_format(structured_data:npt.NDArray,
     
 
 
+def padd_mxfp4_scale(mxfp4_scale: torch.Tensor, final_byte_per_val=4):
+    out: Tensor = torch.zeros( (*mxfp4_scale.shape, final_byte_per_val ),
+                      dtype=torch.uint8)
+
+    out[..., 0] = mxfp4_scale
+    
+    return out 
+
+def concat_mxfp4_scale_data(mxfp4_scale:torch.Tensor, mxfp4_data:torch.Tensor):
+    mxfp4_scale_np = mxfp4_data.numpy()
+    mxfp4_data_np = mxfp4_data.numpy()
+    
+    merged = np.concatenate( [mxfp4_scale_np,mxfp4_data_np],axis=-1).copy()
+    return merged
+
 
 
 
@@ -533,9 +548,14 @@ def dequant_mxfp4_q4nx_data_format(scale_block, data_block, ggml_layout=True):
     vals_low  = KVALUES_MXFP4[low.long()]
     vals_high = KVALUES_MXFP4[high.long()]
 
-    # 3. Arrange in GGML layout
-    dequantized_block = torch.cat((vals_low, vals_high), dim=-1)
+    #3. The data is in regular layout, thus need to interleave it to GGML layout
+    # Interleave vals_low and vals_high along the last dimension
+    dequantized_block = torch.stack((vals_low, vals_high), dim=-1).reshape(*vals_low.shape[:-1], -1)
+    # # 3. Arrange in GGML layout
+    # dequantized_block = torch.cat((vals_low, vals_high), dim=-1)
 
+    
+    
     # 4. Apply scale
     result = dequantized_block * scale.repeat_interleave(32,-1)
 

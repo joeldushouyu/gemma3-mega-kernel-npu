@@ -2,7 +2,7 @@
 from sympy import Q
 from q4nx_util import convert_q41_gguf_data_to_q4nx_format, convert_q80_gguf_data_to_q4nx_format, convert_mxfp4_gguf_data_to_q4nx_format, dequant_mxfp4_q4nx_data_format, dequant_q41_q4nx_data_format, dequant_q80_q4nx_data_format
 import torch.nn.functional as F
-from q4nx_util import compare_q4nx_q80_with_ref, compare_q4nx_q41_with_ref, compare_q4nx_mxfp4_with_ref
+from q4nx_util import compare_q4nx_q80_with_ref, compare_q4nx_q41_with_ref, compare_q4nx_mxfp4_with_ref, padd_mxfp4_scale, concat_mxfp4_scale_data
 from util import print_tensor_erros, print_numpy_errors, restore_from_repack_mxfp4_direct, replace_blk_with_model_layer_str
 import gguf
 from gguf import ReaderTensor
@@ -30,7 +30,7 @@ gguf_packet_dir = str(Path(__file__).parent.parent.parent.joinpath(
 print("gguf_packet_dir:", gguf_packet_dir)
 sys.path.insert(0, gguf_packet_dir)
 
-
+import einops
 def convert_q4_gguf_to_safetensor(gguf_file_path: str,
                                   data_to_save: dict,
                                   data_dequant_debug: dict | None,
@@ -112,6 +112,19 @@ def convert_q4_gguf_to_safetensor(gguf_file_path: str,
                                                  "ffn_gate_inp.weight"]
         mlp_router_weight = torch.tensor(dequantize(
             mlp_router_weight.data, mlp_router_weight.tensor_type), dtype=torch.bfloat16)
+        # At this point, do a data reorder, mlp_router_weight is [num_expert, hidden_size] in row_major order
+        
+        # reorder it to [num_expert/Q4NX_BLOCK_COL_STRIDE, Q4NX_BLOCK_COL_STRIDE, hidden_size] in column major order
+        mlp_router_weight = einops.rearrange(
+            mlp_router_weight,
+            "(num_expert_div_Q4NX_BLOCK_COL_STRIDE Q4NX_BLOCK_COL_STRIDE ) (hidden_size one) -> (num_expert_div_Q4NX_BLOCK_COL_STRIDE  hidden_size) (Q4NX_BLOCK_COL_STRIDE one)",
+            Q4NX_BLOCK_COL_STRIDE=Q4NX_BLOCK_COL_STRIDE,
+            one=1
+        ).contiguous()
+        # This is still in row-major order, change to column major order
+        
+        
+        
         data_to_save[safetensor_layer_common_prefix +
                      "mlp.router.weight"] = mlp_router_weight
 
@@ -214,7 +227,6 @@ def convert_q4_gguf_to_safetensor(gguf_file_path: str,
         # The data is stored as (32, 2880, 1530) where 1530 = 90 * 17 bytes
         ffn_down_exps_weights = gguf_name_to_tensors[gguf_layer_common_prefix +
                                                      "ffn_down_exps.weight"]
-        assert ffn_down_exps_weights.tensor_type.name == "MXFP4", f"Expected MXFP4, got {ffn_down_exps_weights.tensor_type.name}"
         ffn_down_scale, ffn_down_weight = convert_mxfp4_gguf_data_to_q4nx_format(
             ffn_down_exps_weights.data, Q4NX_BLOCK_ROW_SIZE, Q4NX_BLOCK_COL_SIZE, Q4NX_BLOCK_COL_STRIDE)
         data_to_save[safetensor_layer_common_prefix +
@@ -243,6 +255,22 @@ def convert_q4_gguf_to_safetensor(gguf_file_path: str,
         data_to_save[safetensor_layer_common_prefix +
                      "mlp.experts.up_proj_blocks"] = ffn_up_weight
 
+    
+        #to ensure the data matches the sizes of q4nx for q4_1, we now
+        # 1. padd extra 3 byte to each MXFP4 scale data_value
+        # 2. combine scale and data_blocks into one single safetensors
+        ffn_down_scale_padded = padd_mxfp4_scale(ffn_down_scale)
+        ffn_up_scale_padded = padd_mxfp4_scale(ffn_up_scale)
+        ffn_gate_scale_padded = padd_mxfp4_scale(ffn_gate_scale)
+        
+        # data_to_save[safetensor_layer_common_prefix +
+        #                      "mlp.experts.down_proj_comb"] =  
+        
+        
+        
+
+        
+        
         if data_dequant_debug is not None:
             data_dequant_debug[safetensor_layer_common_prefix + "mlp.experts.down_proj"] = torch.tensor(
                 dequantize(ffn_down_exps_weights.data, ffn_down_exps_weights.tensor_type), dtype=torch.bfloat16)

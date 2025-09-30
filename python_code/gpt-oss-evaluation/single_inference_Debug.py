@@ -127,8 +127,20 @@ generated_ids = input_ids.clone()
 # free model
 del model
 
+
+# first, open the "sample_token_id.bin" as input_ids interpret as int32
+import numpy as np
+input_ids_from_file = np.fromfile("sample_token_id.bin", dtype=np.int32)
+input_ids_from_file = torch.from_numpy(input_ids_from_file).unsqueeze(0).to(device)  # add batch dimension and move to device
+print("input_ids_from_file shape:", input_ids_from_file.shape)
+print("input_ids_from_file:", input_ids_from_file)
+# replace the input_ids with the file
+
 # next, run the learn version and compare the generated_ids with 
-generate_ids_learn = input_ids.clone()
+generate_ids_learn = input_ids_from_file.clone()
+
+
+
 
 model_learn = GptOssForCausalLMLearn.from_pretrained(pretrained_model_name_or_path=hf_model_dir, local_files_only=True).eval()
 model_learn = model_learn.to(device)
@@ -149,7 +161,7 @@ for step in range(max_new_tokens):
             for k, v in prefill_data_to_save_tensors.items():
                 # if isinstance(v, torch.Tensor):
                 prefill_data_to_save_tensors[k] = v.contiguous()
-            save_file(prefill_data_to_save_tensors, "prefill_data.safetensors")
+            save_file(prefill_data_to_save_tensors, "prefill_data_debug.safetensors")
         elif step == 1:
             outputs_learn = model_learn(input_ids=generate_ids_learn, attention_mask=torch.ones_like(generate_ids_learn),
                                         decode_data_to_save_tensors=decode_data_to_save_tensors  # only save the decode data for now
@@ -158,7 +170,7 @@ for step in range(max_new_tokens):
             for k, v in decode_data_to_save_tensors.items():
                 if isinstance(v, torch.Tensor):
                     decode_data_to_save_tensors[k] = v.contiguous()
-            save_file(decode_data_to_save_tensors, "decode_data.safetensors")   
+            save_file(decode_data_to_save_tensors, "prefill_data_debug.safetensors")   
         else:
             outputs_learn = model_learn(input_ids=generate_ids_learn, attention_mask=torch.ones_like(generate_ids_learn),
                                         decode_data_to_save_tensors=None  # only save the decode data for now

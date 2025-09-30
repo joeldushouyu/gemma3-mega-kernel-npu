@@ -32,7 +32,7 @@ import gguf
 import einops
 import torch.nn.functional as F
 
-
+from util import reverse_transform_nibble_layout
 
 
 
@@ -55,8 +55,7 @@ def split_ggml_mxfpx_to_scale_blocks(structured_data: np.ndarray):
     scales = blocks[..., 0].astype(np.uint8)
     
     # Extract data (remaining 16 bytes, keep as uint8 for 4-bit unpacking)
-    data =  blocks[..., 1:].astype(np.uint8) #Note, don't reverse nibble
-    
+    data = reverse_transform_nibble_layout( torch.from_numpy( blocks[..., 1:].astype(np.uint8))).numpy()     
     return scales, data
 
 def split_ggml_q80_to_scale_blocks(structured_data: np.ndarray):
