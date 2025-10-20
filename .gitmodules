@@ -23,3 +23,6 @@
 [submodule "SubModules/llama.cpp"]
 	path = SubModules/llama.cpp
 	url = https://github.com/ggml-org/llama.cpp
+[submodule "SubModules/SubModules/sentence-transformers"]
+	path = SubModules/SubModules/sentence-transformers
+	url = https://github.com/UKPLab/sentence-transformers
