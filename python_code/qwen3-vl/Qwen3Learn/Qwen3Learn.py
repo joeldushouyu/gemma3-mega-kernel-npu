@@ -50,9 +50,31 @@ class Qwen3VLVisionMLP(nn.Module):
         self.linear_fc2 = nn.Linear(self.intermediate_size, self.hidden_size, bias=True)
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def forward(self, hidden_state):
-        return self.linear_fc2(self.act_fn(self.linear_fc1(hidden_state)))
-
+    # def forward(self, hidden_state):
+        
+        
+    #     return self.linear_fc2(self.act_fn(self.linear_fc1(hidden_state)))
+    def forward(self, hidden_state, layer_idx:int, visual_tensor_to_save:dict[str,torch.Tensor]=None) -> torch.Tensor:
+            
+            # 1. First Linear Layer (Fully Connected 1)
+            # This projects the input hidden_state into a higher-dimensional space (typically called 'intermediate').
+            intermediate_output = self.linear_fc1(hidden_state)
+            
+            if visual_tensor_to_save is not None:
+                visual_tensor_to_save[f"vision_mlp_linear_fc1_output_{layer_idx}"] = intermediate_output.clone().contiguous()
+            # 2. Activation Function
+            # The non-linearity is applied to the intermediate output.
+            activated_output = self.act_fn(intermediate_output)
+            if visual_tensor_to_save is not None:
+                visual_tensor_to_save[f"vision_mlp_activated_output_{layer_idx}"] = activated_output.clone().contiguous()
+            
+            # 3. Second Linear Layer (Fully Connected 2)
+            # This projects the activated output back to the original (or desired) hidden size.
+            final_output = self.linear_fc2(activated_output)
+            if visual_tensor_to_save is not None:
+                visual_tensor_to_save[f"vision_mlp_final_output_{layer_idx}"] = final_output.clone().contiguous()
+            
+            return final_output
 
 class Qwen3VLVisionPatchEmbed(nn.Module):
     def __init__(self, config) -> None:
@@ -181,6 +203,8 @@ class Qwen3VLVisionAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
+        layer_idx:int,
+        visual_tensor_to_save:dict[str,torch.Tensor]=None,
         rotary_pos_emb: Optional[torch.Tensor] = None,
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs,
@@ -189,9 +213,29 @@ class Qwen3VLVisionAttention(nn.Module):
         query_states, key_states, value_states = (
             self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
         )
+        
+        if visual_tensor_to_save is not None:
+            # undo the permute for saving
+            # undo the permute for saving
+            visual_tensor_to_save[f"vision_attention_q_{layer_idx}"] = (
+                query_states.reshape(seq_length, -1).clone().contiguous()
+            )  # (seq_len, num_heads, head_dim) → (num_heads, seq_len, head_dim)
+            visual_tensor_to_save[f"vision_attention_k_{layer_idx}"] = (
+                key_states.reshape(seq_length, -1).clone().contiguous()
+            )
+            visual_tensor_to_save[f"vision_attention_v_{layer_idx}"] = (
+                value_states.reshape(seq_length, -1).clone().contiguous()
+            )
+
+        
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb_vision(query_states, key_states, cos, sin)
 
+        if visual_tensor_to_save is not None:
+            visual_tensor_to_save[f"vision_attention_q_rotary_{layer_idx}"] = query_states.clone().reshape(seq_length, -1).contiguous()
+            visual_tensor_to_save[f"vision_attention_k_rotary_{layer_idx}"] = key_states.clone().reshape(seq_length, -1).contiguous()
+        
+        
         query_states = query_states.transpose(0, 1).unsqueeze(0)
         key_states = key_states.transpose(0, 1).unsqueeze(0)
         value_states = value_states.transpose(0, 1).unsqueeze(0)
@@ -225,24 +269,73 @@ class Qwen3VLVisionAttention(nn.Module):
                 torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)
             ]
 
-            attn_outputs = [
-                attention_interface(
+            # attn_outputs = [
+            #     attention_interface(
+            #         self,
+            #         q,
+            #         k,
+            #         v,
+            #         attention_mask=None,
+            #         scaling=self.scaling,
+            #         dropout=0.0 if not self.training else self.attention_dropout,
+            #         is_causal=False,
+            #         **kwargs,
+            #     )[0]
+            #     for q, k, v in zip(*splits)
+            # ]
+            # attn_output = torch.cat(attn_outputs, dim=1)
+ 
+            head_outputs_list = []
+            for q, k, v in zip(*splits):
+                
+                
+                cur_seq_len = lengths[len(head_outputs_list)]
+                cur_batch_idx = len(head_outputs_list)
+                if visual_tensor_to_save is not None:
+                    visual_tensor_to_save[f"vision_attention_q_{layer_idx}_{cur_batch_idx}"] = (
+                            q.reshape(cur_seq_len, -1).clone().contiguous()
+                    ) 
+                    visual_tensor_to_save[f"vision_attention_k_{layer_idx}_{cur_batch_idx}"] = (
+                        k.reshape(cur_seq_len, -1).clone().contiguous()
+                    )
+                    visual_tensor_to_save[f"vision_attention_v_{layer_idx}_{cur_batch_idx}"] = (
+                        v.reshape(cur_seq_len, -1).clone().contiguous()
+                    )
+
+                # 1. Compute the output for the current attention head
+                # The attention_interface function returns a tuple, we are interested in the first element ([0])
+                current_head_output, _ = attention_interface(
                     self,
-                    q,
-                    k,
-                    v,
+                    query=q,
+                    key=k,
+                    value=v,
                     attention_mask=None,
                     scaling=self.scaling,
                     dropout=0.0 if not self.training else self.attention_dropout,
                     is_causal=False,
                     **kwargs,
-                )[0]
-                for q, k, v in zip(*splits)
-            ]
-            attn_output = torch.cat(attn_outputs, dim=1)
+                )
+                
+                if visual_tensor_to_save is not None:
+                    visual_tensor_to_save[f"vision_attention_output_{layer_idx}_{cur_batch_idx}"] = (
+                        current_head_output.reshape(cur_seq_len, -1).clone().contiguous()
+                    )
+                
+                # 2. Add the result to the list
+                head_outputs_list.append(current_head_output)
 
+            # 3. Concatenate the outputs from all heads along the feature/hidden dimension (dim=1 in this case)
+            attn_output = torch.cat(head_outputs_list, dim=1)
+            
         attn_output = attn_output.reshape(seq_length, -1).contiguous()
+        
+        if visual_tensor_to_save is not None:
+            visual_tensor_to_save[f"vision_attention_output{layer_idx}"] = attn_output.clone().contiguous()
+        
         attn_output = self.proj(attn_output)
+        
+        if visual_tensor_to_save is not None:
+            visual_tensor_to_save[f"vision_attention_output_proj_{layer_idx}"] = attn_output.clone().contiguous()
         return attn_output
 
 
@@ -254,72 +347,87 @@ class Qwen3VLVisionBlock(nn.Module):
         self.attn = Qwen3VLVisionAttention(config=config)
         self.mlp = Qwen3VLVisionMLP(config=config)
         
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        rotary_pos_emb: Optional[torch.Tensor] = None,
-        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
-        **kwargs,
-    ) -> torch.Tensor:
-        hidden_states = hidden_states + self.attn(
-            self.norm1(hidden_states),
-            cu_seqlens=cu_seqlens,
-            rotary_pos_emb=rotary_pos_emb,
-            position_embeddings=position_embeddings,
-            **kwargs,
-        )
-        hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
-        return hidden_states
-
     # def forward(
     #     self,
     #     hidden_states: torch.Tensor,
     #     cu_seqlens: torch.Tensor,
-    #     layer_idx:int,
     #     rotary_pos_emb: Optional[torch.Tensor] = None,
     #     position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
-    #     visual_tensor_to_save:dict[str,torch.Tensor] = None,
     #     **kwargs,
     # ) -> torch.Tensor:
-    #     # Step 1: Save residual for the attention block
-    #     residual_attn = hidden_states
-
-    #     if visual_tensor_to_save is not None:
-    #         visual_tensor_to_save[f"vision_block_{layer_idx}_input"] = hidden_states
-        
-    #     # Step 2: Apply first normalization
-    #     normed_hidden_states = self.norm1(hidden_states)
-    #     if visual_tensor_to_save is not None:
-    #         visual_tensor_to_save[f"vision_block_{layer_idx}_normed_1"] = normed_hidden_states
-
-    #     # Step 3: Apply self-attention
-    #     attn_output = self.attn(
-    #         normed_hidden_states,
+    #     hidden_states = hidden_states + self.attn(
+    #         self.norm1(hidden_states),
     #         cu_seqlens=cu_seqlens,
     #         rotary_pos_emb=rotary_pos_emb,
     #         position_embeddings=position_embeddings,
     #         **kwargs,
     #     )
-    #     if visual_tensor_to_save is not None:
-    #         visual_tensor_to_save[f"vision_block_{layer_idx}_attn_output"] = attn_output
-
-    #     # Step 4: Add attention residual connection
-    #     hidden_states = residual_attn + attn_output
-
-    #     # Step 5: Save residual for the MLP block
-    #     residual_mlp = hidden_states
-
-    #     # Step 6: Apply second normalization
-    #     normed_hidden_states_2 = self.norm2(hidden_states)
-
-    #     # Step 7: Apply MLP
-    #     mlp_output = self.mlp(normed_hidden_states_2)
-
-    #     # Step 8: Add MLP residual connection
-    #     hidden_states = residual_mlp + mlp_output
-
+    #     hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
     #     return hidden_states
+
+
+    def forward(
+            self,
+            hidden_states: torch.Tensor,
+            cu_seqlens: torch.Tensor,
+            layer_idx:int,
+            rotary_pos_emb: Optional[torch.Tensor] = None,
+            position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+            visual_tensor_to_save:dict[str,torch.Tensor] = None,
+            **kwargs,
+        ) -> torch.Tensor:
+            # --- First Sub-Layer (Self-Attention) ---
+
+            # 1. Store the input to the sub-layer for the residual connection
+            residual_attn = hidden_states
+            
+            if visual_tensor_to_save is not None:
+                visual_tensor_to_save[f"vision_block_input_{layer_idx}"] = hidden_states.clone().contiguous()
+            
+            # 2. Apply Layer Normalization (norm1)
+            normed_attn = self.norm1(hidden_states)
+            if visual_tensor_to_save is not None:
+                visual_tensor_to_save[f"vision_block_normed_1_{layer_idx}"] = normed_attn.clone().contiguous()
+            
+            # 3. Apply Self-Attention (attn)
+            attn_output = self.attn(
+                normed_attn,
+                cu_seqlens=cu_seqlens,
+                layer_idx=layer_idx,
+                visual_tensor_to_save=visual_tensor_to_save,
+                rotary_pos_emb=rotary_pos_emb,
+                position_embeddings=position_embeddings,
+                **kwargs,
+            )
+            if visual_tensor_to_save is not None:
+                visual_tensor_to_save[f"vision_block_attn_output_{layer_idx}"] = attn_output.clone().contiguous()
+            
+            # 4. Add the residual connection and update hidden_states
+            hidden_states = residual_attn + attn_output
+            if visual_tensor_to_save is not None:
+                visual_tensor_to_save[f"vision_block_post_attn_{layer_idx}"] = hidden_states.clone().contiguous()
+
+            # --- Second Sub-Layer (MLP/Feed-Forward Network) ---
+
+            # 1. Store the input to the sub-layer for the residual connection
+            residual_mlp = hidden_states
+            
+            # 2. Apply Layer Normalization (norm2)
+            normed_mlp = self.norm2(hidden_states)
+            if visual_tensor_to_save is not None:
+                visual_tensor_to_save[f"vision_block_normed_2_{layer_idx}"] = normed_mlp.clone().contiguous()
+            # 3. Apply the MLP/FFN
+            mlp_output = self.mlp(normed_mlp, layer_idx=layer_idx, visual_tensor_to_save=visual_tensor_to_save)
+            if visual_tensor_to_save is not None:
+                visual_tensor_to_save[f"vision_block_mlp_output_{layer_idx}"] = mlp_output.clone().contiguous()
+            
+            # 4. Add the residual connection and update hidden_states
+            hidden_states = residual_mlp + mlp_output
+            if visual_tensor_to_save is not None:
+                visual_tensor_to_save[f"vision_block_post_mlp_{layer_idx}"] = hidden_states.clone().contiguous()
+
+            # --- Return Final Output ---
+            return hidden_states
 
 
 class Qwen3VLTextRotaryEmbedding(nn.Module):
@@ -798,12 +906,16 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
                 cu_seqlens=cu_seqlens,
                 position_embeddings=position_embeddings,
                 layer_idx=layer_num,
+                visual_tensor_to_save=visual_tensor_to_save,
                 **kwargs,
             )
             if layer_num in self.deepstack_visual_indexes:
                 deepstack_feature = self.deepstack_merger_list[self.deepstack_visual_indexes.index(layer_num)](
                     hidden_states
                 )
+                if visual_tensor_to_save is not None:
+                    visual_tensor_to_save[f"deepstack_feature_{layer_num}"] = deepstack_feature.clone().contiguous()
+                
                 deepstack_feature_lists.append(deepstack_feature)
 
         hidden_states = self.merger(hidden_states)
@@ -1098,7 +1210,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         # Same implementation as for images
         return self.get_image_features(pixel_values_videos, video_grid_thw)
 
-    def get_image_features(self, pixel_values: torch.FloatTensor, image_grid_thw: Optional[torch.LongTensor] = None):
+    def get_image_features(self, pixel_values: torch.FloatTensor, image_grid_thw: Optional[torch.LongTensor] = None, visual_tensor_to_save:dict[str,torch.Tensor] = None):
         """
         Encodes images into continuous embeddings that can be forwarded to the language model. The deepstack visual features are also returned.
 
@@ -1109,7 +1221,9 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
                 The temporal, height and width of feature shape of each image in LLM.
         """
         pixel_values = pixel_values.type(self.visual.dtype)
-        image_embeds, deepstack_image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+        if visual_tensor_to_save is not None:
+            visual_tensor_to_save["input_pixel_values_reference"] = pixel_values.clone().contiguous()
+        image_embeds, deepstack_image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw, visual_tensor_to_save=visual_tensor_to_save)
         split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
         image_embeds = torch.split(image_embeds, split_sizes)
         return image_embeds, deepstack_image_embeds
@@ -1168,6 +1282,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         image_grid_thw: Optional[torch.LongTensor] = None,
         video_grid_thw: Optional[torch.LongTensor] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        visual_tensor_to_save:dict[str,torch.Tensor] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> Union[tuple, Qwen3VLModelOutputWithPast]:
         r"""
@@ -1186,7 +1301,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         video_mask = None
 
         if pixel_values is not None:
-            image_embeds, deepstack_image_embeds = self.get_image_features(pixel_values, image_grid_thw)
+            image_embeds, deepstack_image_embeds = self.get_image_features(pixel_values, image_grid_thw, visual_tensor_to_save)
             image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
             image_mask, _ = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
@@ -1372,6 +1487,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         video_grid_thw: Optional[torch.LongTensor] = None,
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
+        visual_tensor_to_save: Optional[dict[str, torch.Tensor]] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> Union[tuple, Qwen3VLCausalLMOutputWithPast]:
         r"""
@@ -1398,6 +1514,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             cache_position=cache_position,
+            visual_tensor_to_save=visual_tensor_to_save,
             **kwargs,
         )
 
