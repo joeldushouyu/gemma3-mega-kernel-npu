@@ -3,8 +3,12 @@ project(MegaKernelNPU)
 
 # Set CMake policies to suppress warnings from submodules
 cmake_policy(SET CMP0054 NEW)
-cmake_policy(SET CMP0175 NEW)
-cmake_policy(SET CMP0167 NEW)
+if(POLICY CMP0175)
+    cmake_policy(SET CMP0175 NEW)
+endif()
+if(POLICY CMP0167)
+    cmake_policy(SET CMP0167 NEW)
+endif()
 
 # Optionally, set C++ standard
 set(CMAKE_CXX_STANDARD 23)
