@@ -215,6 +215,12 @@ class Qwen3VLVisionAttention(nn.Module):
         )
         
         if visual_tensor_to_save is not None:
+            # recorde the pure q, k, v result, both the bias and mm without bias
+            mm_with_bias =  self.qkv(hidden_states)
+            visual_tensor_to_save[f"vision_attention_qkv_mm_with_bias_{layer_idx}"] = mm_with_bias.clone().contiguous()
+            mm_without_bias = self.qkv(hidden_states) - self.qkv.bias
+            visual_tensor_to_save[f"vision_attention_qkv_mm_without_bias_{layer_idx}"] = mm_without_bias.clone().contiguous()
+            
             # undo the permute for saving
             # undo the permute for saving
             visual_tensor_to_save[f"vision_attention_q_{layer_idx}"] = (
@@ -292,14 +298,17 @@ class Qwen3VLVisionAttention(nn.Module):
                 cur_seq_len = lengths[len(head_outputs_list)]
                 cur_batch_idx = len(head_outputs_list)
                 if visual_tensor_to_save is not None:
+                    # Shape: q/k/v are (1, seq_len, num_heads, head_dim)
+                    # After squeeze(0): (seq_len, num_heads, head_d
+                    # After reshape: (seq_len, num_heads * head_dim) - NO permute needed!
                     visual_tensor_to_save[f"vision_attention_q_{layer_idx}_{cur_batch_idx}"] = (
-                            q.reshape(cur_seq_len, -1).clone().contiguous()
+                            q.squeeze(0).reshape(cur_seq_len, -1).clone().contiguous()
                     ) 
                     visual_tensor_to_save[f"vision_attention_k_{layer_idx}_{cur_batch_idx}"] = (
-                        k.reshape(cur_seq_len, -1).clone().contiguous()
+                        k.squeeze(0).reshape(cur_seq_len, -1).clone().contiguous()
                     )
                     visual_tensor_to_save[f"vision_attention_v_{layer_idx}_{cur_batch_idx}"] = (
-                        v.reshape(cur_seq_len, -1).clone().contiguous()
+                        v.squeeze(0).reshape(cur_seq_len, -1).clone().contiguous()
                     )
 
                 # 1. Compute the output for the current attention head
@@ -317,8 +326,11 @@ class Qwen3VLVisionAttention(nn.Module):
                 )
                 
                 if visual_tensor_to_save is not None:
+                    # current_head_output shape: (1, seq_len, num_heads, head_dim)
+                    # After squeeze(0): (seq_len, num_heads, head_dim)
+                    # After reshape: (seq_len, num_heads * head_dim) - NO permute needed!
                     visual_tensor_to_save[f"vision_attention_output_{layer_idx}_{cur_batch_idx}"] = (
-                        current_head_output.reshape(cur_seq_len, -1).clone().contiguous()
+                        current_head_output.squeeze(0).reshape(cur_seq_len, -1).clone().contiguous()
                     )
                 
                 # 2. Add the result to the list
@@ -345,7 +357,7 @@ class Qwen3VLVisionBlock(nn.Module):
         self.norm1 = nn.LayerNorm(config.hidden_size, eps=1e-6)
         self.norm2 = nn.LayerNorm(config.hidden_size, eps=1e-6)
         self.attn = Qwen3VLVisionAttention(config=config)
-        self.mlp = Qwen3VLVisionMLP(config=config)
+        self.mlp: Qwen3VLVisionMLP = Qwen3VLVisionMLP(config=config)
         
     # def forward(
     #     self,
@@ -465,7 +477,20 @@ class Qwen3VLTextRotaryEmbedding(nn.Module):
         for dim, offset in enumerate((1, 2), start=1):  # H, W
             length = mrope_section[dim] * 3
             idx = slice(offset, length, 3)
+            
+            a_tem = freqs[dim, ..., idx]
+            b_tem = freqs_t[..., idx]
+            
+            # compute l1, l2, rmse, cosine simlarity for debug
+            diff = a_tem - b_tem
+            l1 = torch.abs(diff).mean().item()
+            l2 = torch.sqrt((diff ** 2).mean()).item()
+            rmse = torch.sqrt((diff ** 2).mean()).item()
+            cosine_sim = F.cosine_similarity(a_tem.flatten(), b_tem.flatten(), dim=0).item()
+            print(f"dim {dim} offset {offset} l1: {l1:.6f}, l2: {l2:.6f}, rmse: {rmse:.6f}, cosine_sim: {cosine_sim:.6f}")
             freqs_t[..., idx] = freqs[dim, ..., idx]
+        
+        
         return freqs_t
 
     @torch.no_grad()
@@ -888,6 +913,12 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
         rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
         emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
         position_embeddings = (emb.cos(), emb.sin())
+        
+        if visual_tensor_to_save is not None:
+            visual_tensor_to_save["position_embeddings_cos"] = position_embeddings[0].clone().contiguous()
+            visual_tensor_to_save["position_embeddings_sin"] = position_embeddings[1].clone().contiguous()
+        
+         # Compute cumulative sequence lengths for flash attention
 
         cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
             dim=0,
@@ -917,9 +948,12 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
                     visual_tensor_to_save[f"deepstack_feature_{layer_num}"] = deepstack_feature.clone().contiguous()
                 
                 deepstack_feature_lists.append(deepstack_feature)
-
+        if visual_tensor_to_save is not None:
+            visual_tensor_to_save["before_merger_hidden_states"] = hidden_states.clone().contiguous()
+        
         hidden_states = self.merger(hidden_states)
-
+        if visual_tensor_to_save is not None:
+            visual_tensor_to_save["final_hidden_states_after_merger"] = hidden_states.clone().contiguous()
         return hidden_states, deepstack_feature_lists
 
 

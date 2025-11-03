@@ -23,6 +23,7 @@ messages = [
     {
         "role": "user",
         "content": [
+            {"type": "image", "image": "https://miro.medium.com/v2/resize:fit:450/1*9dbWWY4LzLIkjEHvDf4bDQ.jpeg"},
             {"type": "image", "image": "https://files.softicons.com/download/social-media-icons/simple-icons-by-dan-leech/png/512x512/google.png"},
             {"type": "image", "image": "https://m.media-amazon.com/images/I/71LCi1gwwwL._AC_UF1000,1000_QL80_.jpg"},
             {"type": "text", "text": "Describe the two images."},
